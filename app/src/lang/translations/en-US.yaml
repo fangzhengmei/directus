@@ -1386,7 +1386,7 @@ ai_assistant: AI Assistant
 ai_disabled_by_env: AI Assistant features have been disabled via environment variable.
 mcp_disabled_by_env: MCP features have been disabled via environment variable.
 mcp_oauth_clients: 'MCP OAuth Clients'
-manage_registered_clients: 'Manage registered clients'
+manage_registered_clients: 'Manage Registered Clients'
 no_oauth_clients: 'No OAuth clients have been registered yet.'
 revoke_client: 'Revoke Client'
 revoke_client_confirm:
