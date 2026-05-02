@@ -5,10 +5,11 @@
 Directus 的 Schema 推断机制是一个设计精良的多层架构系统，它不仅能够从现有数据库中自动推断表结构、字段类型和关系，还包含了复杂的缓存并发控制、重试机制、跨实例同步以及完整的元数据合并刷新路径。
 
 本报告深入分析 Directus Schema 推断的完整运行时机制，重点包括：
-- 缓存机制与并发控制
+- 缓存机制与并发控制（**已纠正**）
 - 重试机制与容错处理
-- 跨实例同步信号机制
+- 跨实例同步信号机制（**已纠正**）
 - 推断结果与元数据合并的完整路径
+- Schema 刷新链路的触发条件、失效与重建衔接（**已纠正**）
 - 多数据库差异抹平的正确层次
 
 ## 2. 架构层次重新梳理
@@ -27,10 +28,10 @@ Directus 的 Schema 推断机制是一个设计精良的多层架构系统，它
                                           ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                         Schema 缓存与并发控制层 (Cache & Concurrency)              │
-│  - getMemorySchemaCache() / setMemorySchemaCache(): 内存级缓存                     │
-│  - localSchemaCache: Keyv 本地缓存（支持内存或 Redis）                              │
-│  - useLock(): 分布式锁（本地或 Redis）                                              │
-│  - useBus(): 消息总线（本地或 Redis Pub/Sub）                                       │
+│  - getMemorySchemaCache() / setMemorySchemaCache(): 进程内内存缓存（最快）          │
+│  - localSchemaCache: Keyv 缓存（**硬编码 memory，不支持 Redis**）                  │
+│  - useLock(): 分布式锁（遵循 CACHE_STORE，支持本地或 Redis）                        │
+│  - useBus(): 消息总线（遵循 Redis 配置，支持本地事件或 Redis Pub/Sub）               │
 │  - 并发控制: 单进程构建 + 多进程等待                                                 │
 │  - 重试机制: 最多 3 次重试 + 超时保护                                               │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -63,20 +64,20 @@ Directus 的 Schema 推断机制是一个设计精良的多层架构系统，它
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 关键组件职责
+### 2.2 关键组件职责（已纠正）
 
-| 层次 | 组件 | 主要职责 |
-|------|------|----------|
-| 业务层 | `SchemaOverview` | 完整的业务 schema 视图，包含集合、字段、关系 |
-| 业务层 | `schema` 中间件 | 每个 HTTP 请求获取 schema 并附加到 `req.schema` |
-| 缓存层 | `getSchema()` | schema 获取的入口函数，处理缓存、并发、重试 |
-| 缓存层 | `memorySchemaCache` | 进程内内存缓存，最快的缓存层 |
-| 缓存层 | `localSchemaCache` | Keyv 缓存，支持内存或 Redis |
-| 缓存层 | `useLock()` | 分布式锁，控制并发构建 |
-| 缓存层 | `useBus()` | 消息总线，跨实例同步 |
-| 元数据层 | `getDatabaseSchema()` | 实际构建 schema，合并数据库与元数据 |
-| 元数据层 | `RelationsService` | 关系数据的获取与合并 |
-| Inspector层 | `SchemaInspector` | 方言适配，数据库差异抹平 |
+| 层次 | 组件 | 主要职责 | 存储后端 |
+|------|------|----------|----------|
+| 业务层 | `SchemaOverview` | 完整的业务 schema 视图，包含集合、字段、关系 | - |
+| 业务层 | `schema` 中间件 | 每个 HTTP 请求获取 schema 并附加到 `req.schema` | - |
+| 缓存层 | `getSchema()` | schema 获取的入口函数，处理缓存、并发、重试 | - |
+| 缓存层 | `memorySchemaCache` | 进程内内存缓存，最快的缓存层 | **进程内存** |
+| 缓存层 | `localSchemaCache` | Keyv 缓存，用于缓存外键等中间数据 | **硬编码 memory（不支持 Redis）** |
+| 缓存层 | `useLock()` | 分布式锁，控制并发构建 | 遵循 `CACHE_STORE` |
+| 缓存层 | `useBus()` | 消息总线，跨进程/实例通知 | 遵循 Redis 配置 |
+| 元数据层 | `getDatabaseSchema()` | 实际构建 schema，合并数据库与元数据 | - |
+| 元数据层 | `RelationsService` | 关系数据的获取与合并 | - |
+| Inspector层 | `SchemaInspector` | 方言适配，数据库差异抹平 | - |
 
 ## 3. 核心入口：getSchema() 函数
 
@@ -103,7 +104,7 @@ export async function getSchema(
     return await getDatabaseSchema(database, schemaInspector);
   }
 
-  // 步骤 2: 检查内存缓存
+  // 步骤 2: 检查内存缓存（最快路径）
   const cached = getMemorySchemaCache();
   if (cached) {
     return cached;
@@ -188,9 +189,9 @@ export async function getSchema(
 
 ### 3.2 关键机制解析
 
-#### 3.2.1 缓存层次
+#### 3.2.1 缓存层次（已纠正）
 
-Directus 实现了多层缓存机制：
+Directus 实现了多层缓存机制，但各层的存储后端不同：
 
 1. **内存缓存 (`memorySchemaCache`)**：
    - 最快的缓存层，存储在进程内存中
@@ -219,10 +220,29 @@ export function getMemorySchemaCache(): Readonly<SchemaOverview> | undefined {
 ```
 [api/src/cache.ts:133-149](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/cache.ts)
 
-2. **本地 Schema 缓存 (`localSchemaCache`)**：
-   - 使用 Keyv 抽象，支持内存或 Redis 存储
-   - 用于缓存外键信息等中间数据
-   - 通过 `getCacheValue()` 和 `setCacheValue()` 访问
+2. **本地 Schema 缓存 (`localSchemaCache`) - 重要纠偏**：
+
+   **⚠️ 关键发现：`localSchemaCache` 硬编码使用 `'memory'` 存储，不遵循 `CACHE_STORE` 环境变量！**
+
+   看源码 `cache.ts` 第 78-81 行：
+   ```typescript
+   if (localSchemaCache === null) {
+     localSchemaCache = getKeyvInstance('memory', getMilliseconds(env['CACHE_SYSTEM_TTL']), '_schema');
+     // 第一个参数是硬编码的 'memory'，不是 env['CACHE_STORE']！
+     localSchemaCache.on('error', (err) => logger.warn(err, `[schema-cache] ${err}`));
+   }
+   ```
+
+   对比其他缓存（都遵循 `CACHE_STORE`）：
+   - `systemCache`: 第 68 行：`getKeyvInstance(env['CACHE_STORE'] as Store, ...)`
+   - `deploymentCache`: 第 74 行：`getKeyvInstance(env['CACHE_STORE'] as Store, ...)`
+   - `lockCache`: 第 84 行：`getKeyvInstance(env['CACHE_STORE'] as Store, ...)`
+   - **`localSchemaCache`**: 第 79 行：`getKeyvInstance('memory', ...)` - **硬编码 memory！**
+
+   `localSchemaCache` 的实际用途：
+   - 用于缓存 `foreignKeys` 等中间数据（见 `RelationsService.foreignKeys()`）
+   - 是**进程内的本地缓存**，不用于跨实例共享
+   - 跨实例同步是通过 `schemaChanged` 消息总线实现的，不是通过共享缓存
 
 ```typescript
 // 在 RelationsService.foreignKeys() 中的使用
@@ -251,7 +271,7 @@ async foreignKeys(collection?: string) {
 Directus 使用**分布式锁 + 消息总线**的组合来处理并发：
 
 **锁机制 (`useLock`)**：
-- 支持本地锁（单实例）或 Redis 锁（多实例）
+- 支持本地锁（单实例）或 Redis 锁（多实例）- **遵循 `CACHE_STORE`**
 - 使用原子递增操作 (`lock.increment()`) 来分配"处理者"
 - 只有 `processId === 1` 的进程是实际的构建者
 
@@ -373,68 +393,134 @@ if (attempt >= MAX_ATTEMPTS) {
 ```
 [api/src/utils/get-schema.ts:51-98](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/utils/get-schema.ts)
 
-## 4. 跨实例同步机制
+## 4. Schema 刷新链路详解（已纠正）
 
-在多实例部署场景下，Directus 需要确保所有实例的 schema 缓存保持一致。
+### 4.1 触发条件：谁调用了 clearSystemCache？
 
-### 4.1 同步触发点
+Schema 缓存的清除由 `clearSystemCache()` 函数触发，该函数被以下服务调用：
 
-Schema 缓存的清除和同步在以下情况触发：
+| 服务 | 文件位置 | 触发场景 |
+|------|----------|----------|
+| **CollectionsService** | [api/src/services/collections.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/collections.ts) | 创建/更新/删除集合 (248, 299, 494, 553, 603, 787, 835行) |
+| **FieldsService** | [api/src/services/fields.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/fields.ts) | 创建/更新/删除字段 (489, 644, 683, 891行) |
+| **RelationsService** | [api/src/services/relations.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/relations.ts) | 创建/更新/删除关系 (295, 422, 508行) |
+| **PermissionsService** | [api/src/services/permissions.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/permissions.ts) | 权限变更 (27行) |
+| **AccessService** | [api/src/services/access.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/access.ts) | 访问控制变更 (12行) |
+| **RolesService** | [api/src/services/roles.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/roles.ts) | 角色变更 (122行) |
+| **UsersService** | [api/src/services/users.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/users.ts) | 用户变更 (651行) |
+| **PoliciesService** | [api/src/services/policies.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/policies.ts) | 策略变更 (15行) |
+| **UtilsService** | [api/src/services/utils.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/utils.ts) | 手动清除缓存端点 (167行) |
+| **CLI** | [api/src/cli/commands/cache/clear.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/cli/commands/cache/clear.ts) | `cache:clear` 命令 (20行) |
+| **GraphQL Resolvers** | [api/src/services/graphql/resolvers/system-global.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/graphql/resolvers/system-global.ts) | GraphQL 系统变更 (431行) |
+| **AI Tools** | [api/src/ai/tools/fields/index.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/ai/tools/fields/index.ts) | AI 工具操作 (116, 180行) |
 
-1. **Schema 变更操作**：
-   - 创建/更新/删除集合
-   - 创建/更新/删除字段
-   - 创建/更新/删除关系
-
-2. **手动触发**：
-   - 调用 `clearSystemCache()`
-
-### 4.2 同步流程
+### 4.2 失效机制：clearSystemCache() 做了什么？
 
 ```typescript
-// 缓存清除和同步的核心函数
 export async function clearSystemCache(opts?: {
   forced?: boolean | undefined;
   autoPurgeCache?: false | undefined;
 }): Promise<void> {
   const { systemCache, localSchemaCache, lockCache } = getCache();
 
-  // 步骤 1: 刷新系统缓存（带锁保护）
+  // 步骤 1: 刷新系统缓存（带锁保护，防止并发清除）
+  // 只有当 forced=true 或 system-cache-lock 不存在时才执行
   if (opts?.forced || !(await lockCache.get('system-cache-lock'))) {
     await lockCache.set('system-cache-lock', true, 10000);  // 加锁 10 秒
-    await systemCache.clear();
-    await lockCache.delete('system-cache-lock');
+    await systemCache.clear();  // 清除系统缓存
+    await lockCache.delete('system-cache-lock');  // 释放锁
   }
 
-  // 步骤 2: 清除本地 schema 缓存
+  // 步骤 2: 清除本地 schema 缓存（Keyv 内存缓存）
   await localSchemaCache.clear();
-  memorySchemaCache = null;  // 清除内存缓存
 
-  // 步骤 3: 清除权限缓存（依赖 schema）
+  // 步骤 3: 清除内存缓存（进程内最快缓存）
+  memorySchemaCache = null;
+
+  // 步骤 4: 清除权限缓存（因为权限检查依赖 schema）
   await clearPermissionCache();
 
-  // 步骤 4: 发布消息，通知其他实例
+  // 步骤 5: 发布消息，通知其他实例（关键：跨实例同步）
   messenger.publish<CacheMessage>('schemaChanged', { autoPurgeCache: opts?.autoPurgeCache });
 }
 ```
 [api/src/cache.ts:97-117](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/cache.ts)
 
-### 4.3 跨实例消息监听
+### 4.3 跨实例同步机制（重要纠偏）
 
-每个实例在启动时订阅 `schemaChanged` 消息：
+**⚠️ 关键发现：缓存不是跨实例共享的，而是通过消息总线同步"失效信号"！**
+
+之前的描述可能暗示缓存是共享的，但实际架构是：
+
+1. **每个实例有自己独立的缓存**：
+   - `memorySchemaCache`：每个进程自己的内存
+   - `localSchemaCache`：每个实例自己的 Keyv 内存缓存（硬编码 memory）
+
+2. **同步的是"失效信号"，不是缓存数据**：
+   - 实例 A 变更 schema → 清除**自己的**缓存 → 发布 `schemaChanged` 消息
+   - 其他实例收到消息 → 清除**各自的**缓存
+   - 下次请求时，每个实例**各自**重建缓存
+
+**完整的跨实例同步流程**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           实例 A (执行变更的实例)                                   │
+│                                                                                   │
+│  1. 用户操作: POST /fields (创建新字段)                                           │
+│                    │                                                              │
+│                    ▼                                                              │
+│  2. FieldsService.createOne() 执行数据库变更                                      │
+│                    │                                                              │
+│                    ▼                                                              │
+│  3. 调用 clearSystemCache():                                                      │
+│     ├─→ await localSchemaCache.clear()     ← 清除自己的 Keyv 缓存                │
+│     ├─→ memorySchemaCache = null           ← 清除自己的内存缓存                   │
+│     └─→ messenger.publish('schemaChanged', {...})  ← 发布消息！                  │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Redis Pub/Sub
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      Redis (消息中间件)                                           │
+│                                                                                   │
+│  PUBLISH directus:bus:schemaChanged {autoPurgeCache: undefined}                  │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+              ▼               ▼               ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│    实例 B        │ │    实例 C        │ │    实例 D        │
+│                  │ │                  │ │                  │
+│  订阅者收到消息:  │ │  订阅者收到消息:  │ │  订阅者收到消息:  │
+│                  │ │                  │ │                  │
+│  messenger.subscribe('schemaChanged', │ │ messenger.subscribe('schemaChanged', │ │ messenger.subscribe('schemaChanged', │
+│    async (opts) => {                 │ │   async (opts) => {                 │ │   async (opts) => {                 │
+│      await localSchemaCache?.clear();│ │     await localSchemaCache?.clear();│ │     await localSchemaCache?.clear();│
+│      memorySchemaCache = null;       │ │     memorySchemaCache = null;       │ │     memorySchemaCache = null;       │
+│    })                                 │ │   })                                 │ │   })                                 │
+│                  │ │                  │ │                  │
+│  各自清除自己的缓存 │ │  各自清除自己的缓存 │ │  各自清除自己的缓存 │
+└──────────────────┘ └──────────────────┘ └──────────────────┘
+```
+
+**消息订阅的源码**（cache.ts 第 41-51 行）：
 
 ```typescript
-// 在 cache.ts 中的订阅逻辑
+// 只有当 Redis 可用时才订阅（单实例时使用本地事件总线）
 if (redisConfigAvailable() && !messengerSubscribed) {
   messengerSubscribed = true;
 
   messenger.subscribe<CacheMessage>('schemaChanged', async (opts) => {
-    // 如果使用内存缓存且配置了自动清除
+    // 如果使用内存缓存且配置了自动清除，清除 API 响应缓存
     if (env['CACHE_STORE'] === 'memory' && env['CACHE_AUTO_PURGE'] && cache && opts?.['autoPurgeCache'] !== false) {
       await cache.clear();
     }
 
-    // 关键：清除所有实例的 schema 缓存
+    // 关键：每个实例各自清除自己的 schema 缓存
     await localSchemaCache?.clear();
     memorySchemaCache = null;
   });
@@ -442,13 +528,213 @@ if (redisConfigAvailable() && !messengerSubscribed) {
 ```
 [api/src/cache.ts:41-52](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/cache.ts)
 
-### 4.4 同步机制总结
+### 4.4 失效与重建的衔接
 
-| 场景 | 同步方式 |
-|------|----------|
-| 单实例部署 | 本地事件总线 + 内存缓存直接清除 |
-| 多实例 + Redis | Redis Pub/Sub 发布 `schemaChanged` 消息 |
-| 并发构建时 | Redis 锁 + Redis Pub/Sub 通知构建结果 |
+缓存失效后，重建发生在**下一次请求**时，衔接流程如下：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        缓存失效阶段 (已执行 clearSystemCache)                      │
+│                                                                                   │
+│  所有实例的状态:                                                                   │
+│  - memorySchemaCache = null                                                       │
+│  - localSchemaCache 已被 clear()                                                  │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼ 下一个 HTTP 请求到达
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        重建触发阶段                                                │
+│                                                                                   │
+│  1. 请求进入 → schema 中间件执行                                                  │
+│                                                                                   │
+│     const schema: RequestHandler = asyncHandler(async (req, _res, next) => {  │
+│       req.schema = await getSchema();  // 关键调用                               │
+│       return next();                                                              │
+│     });                                                                           │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        getSchema() 执行流程                                        │
+│                                                                                   │
+│  1. 检查 bypassCache 或 CACHE_SCHEMA=false → 否                                  │
+│                                                                                   │
+│  2. 检查内存缓存:                                                                  │
+│     const cached = getMemorySchemaCache();                                       │
+│     // 返回 undefined（因为 memorySchemaCache = null）                            │
+│                                                                                   │
+│  3. 获取锁和消息总线:                                                              │
+│     const lock = useLock();                                                       │
+│     const bus = useBus();                                                         │
+│     const processId = await lock.increment('schemaCache--preparing');            │
+│                                                                                   │
+│  4. 竞争构建权:                                                                    │
+│     - 如果 processId === 1 → 我是构建者                                          │
+│     - 如果 processId !== 1 → 我是等待者                                          │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            │ 构建者 (processId=1)  │   等待者 (processId>1) │
+            ▼                       ▼
+┌──────────────────────┐  ┌────────────────────────────────┐
+│ 调用 getDatabaseSchema│  │ 订阅 'schemaCache--done' 消息  │
+│ 实际构建 schema       │  │ 等待构建者完成通知             │
+│                      │  │                                │
+│ 1. schemaInspector.  │  │ 超时: CACHE_SCHEMA_SYNC_TIMEOUT│
+│    overview()        │  │                                │
+│                      │  │ 收到消息后:                    │
+│ 2. 查询 directus_    │  │ setMemorySchemaCache(schema)  │
+│    collections       │  │ 返回 schema                    │
+│                      │  │                                │
+│ 3. 查询 directus_    │  │ 超时/失败: 重试 getSchema()   │
+│    fields            │  │                                │
+│                      │  └────────────────────────────────┘
+│ 4. 合并 fields 元数据│
+│                      │
+│ 5. RelationsService. │
+│    readAll()         │
+│                      │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│  构建完成后:                                                   │
+│                                                               │
+│  1. setMemorySchemaCache(schema)  ← 设置自己的内存缓存        │
+│                                                               │
+│  2. bus.publish('schemaCache--done', { schema })             │
+│     ↓                                                         │
+│     通知其他等待者（同一实例内的其他请求或其他实例？）          │
+│                                                               │
+│     ⚠️ 注意：这里的消息总线用途不同！                          │
+│     - 'schemaCache--done': 用于同一实例内并发请求的协调        │
+│     - 'schemaChanged': 用于跨实例的缓存失效通知               │
+│                                                               │
+│  3. lock.delete('schemaCache--preparing')  ← 释放锁          │
+│                                                               │
+│  4. 返回 schema                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 4.5 两种消息总线的区别
+
+| 消息键 | 发布时机 | 用途 | 范围 |
+|--------|----------|------|------|
+| `schemaCache--done` | `getSchema()` 构建完成后 | 同一实例内并发请求的协调：构建者通知等待者 | **进程内/同实例** |
+| `schemaChanged` | `clearSystemCache()` 执行后 | 跨实例同步：通知所有实例清除缓存 | **多实例（Redis Pub/Sub）** |
+
+**关键区别**：
+- `schemaCache--done`：用于**并发构建**场景，多个请求同时到达时，一个构建，其他等待
+- `schemaChanged`：用于**缓存失效**场景，一个实例变更后，通知所有实例清除缓存
+
+### 4.6 完整的刷新链路流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              用户发起 Schema 变更操作                                  │
+│                    (如: POST /fields, PATCH /relations)                               │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              服务层执行数据库变更                                        │
+│  (CollectionsService / FieldsService / RelationsService 等)                           │
+│                                                                                       │
+│  在 finally 块中:                                                                      │
+│  if (opts?.autoPurgeSystemCache !== false) {                                         │
+│    await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });                 │
+│  }                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         clearSystemCache() 执行（当前实例）                            │
+│                                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 清除系统缓存 (带锁保护)                                                      │   │
+│  │    if (opts?.forced || !(await lockCache.get('system-cache-lock'))) {         │   │
+│  │      await lockCache.set('system-cache-lock', true, 10000);                   │   │
+│  │      await systemCache.clear();                                                 │   │
+│  │      await lockCache.delete('system-cache-lock');                              │   │
+│  │    }                                                                            │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                          │                                            │
+│                                          ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 2. 清除 Schema 缓存（当前实例）                                                 │   │
+│  │    await localSchemaCache.clear();    ← Keyv 内存缓存                         │   │
+│  │    memorySchemaCache = null;           ← 进程内存缓存                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                          │                                            │
+│                                          ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 3. 清除依赖缓存                                                                │   │
+│  │    await clearPermissionCache();  ← 权限缓存依赖 schema                       │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                          │                                            │
+│                                          ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 4. 发布跨实例同步消息                                                          │   │
+│  │    messenger.publish<CacheMessage>('schemaChanged', {                         │   │
+│  │      autoPurgeCache: opts?.autoPurgeCache                                     │   │
+│  │    });                                                                         │   │
+│  │                                                                                 │   │
+│  │    ↓ 如果是 Redis 环境，这会发布到 Redis Pub/Sub                                │   │
+│  │    ↓ 所有订阅的实例都会收到                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          │ Redis Pub/Sub (多实例场景)
+                                          │ 或 本地事件总线 (单实例场景)
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         其他实例收到 'schemaChanged' 消息                            │
+│                         (通过 messenger.subscribe 监听)                                │
+│                                                                                       │
+│  每个实例各自执行:                                                                     │
+│  messenger.subscribe<CacheMessage>('schemaChanged', async (opts) => {              │
+│                                                                                       │
+│    // 可选：清除 API 响应缓存                                                          │
+│    if (env['CACHE_STORE'] === 'memory' && env['CACHE_AUTO_PURGE'] && ...) {        │
+│      await cache.clear();                                                             │
+│    }                                                                                  │
+│                                                                                       │
+│    // 关键：清除自己的 schema 缓存                                                     │
+│    await localSchemaCache?.clear();    ← 自己的 Keyv 缓存                           │
+│    memorySchemaCache = null;           ← 自己的内存缓存                              │
+│  });                                                                                  │
+│                                                                                       │
+│  ⚠️ 注意：没有重建，只是清除！重建发生在下一次请求时。                                   │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼ 下一个 HTTP 请求到达任意实例
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         缓存重建阶段（懒加载）                                          │
+│                                                                                       │
+│  1. schema 中间件调用 getSchema()                                                    │
+│                                                                                       │
+│  2. getMemorySchemaCache() 返回 undefined (缓存已失效)                                │
+│                                                                                       │
+│  3. 获取锁 → 竞争构建权 → 一个构建，其他等待                                          │
+│                                                                                       │
+│  4. 调用 getDatabaseSchema() 实际重建:                                                │
+│     ├─→ schemaInspector.overview()     ← 从数据库获取原始 schema                      │
+│     ├─→ 查询 directus_collections     ← 集合元数据                                    │
+│     ├─→ 查询 directus_fields          ← 字段元数据                                    │
+│     ├─→ 合并 fields 元数据            ← 用元数据更新默认字段信息                       │
+│     └─→ RelationsService.readAll()   ← 获取并合并关系                                │
+│                                                                                       │
+│  5. 设置内存缓存: setMemorySchemaCache(schema)                                        │
+│                                                                                       │
+│  6. 返回 schema                                                                       │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ## 5. 元数据合并：getDatabaseSchema() 详解
 
@@ -630,34 +916,17 @@ private stitchRelations(metaRows: RelationMeta[], schemaRows: ForeignKey[]) {
 ```
 [api/src/services/relations.ts:526-563](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/relations.ts)
 
-### 5.3 类型推断机制
-
-`getLocalType()` 函数负责从数据库列类型推断 Directus 字段类型：
-
-```typescript
-// 这是一个关键的类型映射点
-// 从 Column.data_type 映射到 Directus 的 Type
-
-// 示例：MySQL 的 tinyint(1) 被映射为 boolean
-// 在 MySQLSchemaInspector.rawColumnToColumn() 中：
-if (rawColumn.COLUMN_TYPE.startsWith('tinyint(1)')) {
-  dataType = 'boolean';
-}
-
-// 然后在 getLocalType() 中进一步映射到 Directus 类型
-```
-
 ## 6. 多数据库差异抹平的正确层次
 
 ### 6.1 差异抹平的三层架构
 
 之前的描述有偏差，正确的差异抹平发生在三个层次：
 
-| 层次 | 组件 | 抹平的差异 | 输出 |
-|------|------|-----------|------|
-| 第一层 | `SchemaInspector` 方言实现 | SQL 语法、系统表结构、类型命名 | `Column`、`Table`、`ForeignKey` |
-| 第二层 | `getLocalType()` 等函数 | 数据库类型到 Directus 类型的映射 | Directus `Type` |
-| 第三层 | `sanitize-*` 函数 | 移除数据库特有属性，标准化结构 | 用于快照/比较的标准化对象 |
+| 层次 | 组件 | 抹平的差异 | 输出 | 使用场景 |
+|------|------|-----------|------|----------|
+| 第一层 | `SchemaInspector` 方言实现 | SQL 语法、系统表结构、类型命名 | `Column`、`Table`、`ForeignKey` | **运行时**：所有需要访问数据库 schema 的场景 |
+| 第二层 | `getLocalType()` 等函数 | 数据库类型到 Directus 类型的映射 | Directus `Type` | **运行时**：构建业务 schema 时 |
+| 第三层 | `sanitize-*` 函数 | 移除数据库特有属性，标准化结构 | 用于快照/比较的标准化对象 | **快照/版本比较**：不是运行时使用 |
 
 ### 6.2 第一层：SchemaInspector 方言层
 
@@ -687,9 +956,9 @@ if (rawColumn.COLUMN_TYPE.startsWith('tinyint(1)')) {
 - `boolean` → `boolean`
 - 等等
 
-### 6.4 第三层：标准化层
+### 6.4 第三层：标准化层（重要纠偏）
 
-`sanitize-*` 函数用于**快照和比较**场景，移除所有数据库特有属性：
+`sanitize-*` 函数用于**快照和比较**场景，**不是运行时的差异抹平**！
 
 ```typescript
 export function sanitizeColumn(column: Column) {
@@ -699,7 +968,7 @@ export function sanitizeColumn(column: Column) {
     'is_nullable', 'is_unique', 'is_indexed',
     'is_primary_key', 'is_generated', 'generation_expression',
     'has_auto_increment', 'foreign_key_table', 'foreign_key_column',
-    // 注意：这里没有包含：
+    // 注意：这里移除了数据库特有属性：
     // - schema (PostgreSQL 特有)
     // - foreign_key_schema (PostgreSQL 特有)
     // - comment (不是所有数据库都支持)
@@ -708,191 +977,12 @@ export function sanitizeColumn(column: Column) {
 ```
 [api/src/utils/sanitize-schema.ts:59-78](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/utils/sanitize-schema.ts)
 
-**重要**：这一层不是用于"抹平差异供业务层使用"，而是用于**schema 快照和版本比较**。业务层使用的是完整的 `Column` 对象，包括所有数据库特有属性。
+**⚠️ 关键纠偏**：
+- ❌ 之前的描述：`sanitize-*` 是运行时的差异抹平层
+- ✅ 正确理解：`sanitize-*` 函数是用于**schema 快照和版本比较**的标准化工具
+- 运行时业务层使用的是**完整的 `Column` 对象**，包括所有数据库特有属性
 
-## 7. 完整的 Schema 刷新路径
-
-### 7.1 从请求到响应的完整路径
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           HTTP 请求进入                                    │
-│                         (GET /items/users)                                 │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      schema 中间件 (middleware/schema.ts)                 │
-│                                                                           │
-│  const schema: RequestHandler = asyncHandler(async (req, _res, next) => {│
-│    req.schema = await getSchema();  // 关键调用                            │
-│    return next();                                                         │
-│  });                                                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         getSchema() 入口                                   │
-│                                                                           │
-│  1. 检查 bypassCache 或 CACHE_SCHEMA=false                                │
-│  2. 检查 memorySchemaCache (最快路径)                                      │
-│  3. 未命中 → 获取锁 → 竞争处理权                                           │
-│  4. 处理者 → 调用 getDatabaseSchema()                                      │
-│  5. 等待者 → 订阅消息总线等待                                              │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     getDatabaseSchema() 核心构建                           │
-│                                                                           │
-│  1. schemaInspector.overview() → 数据库原始 schema                         │
-│     └─→ 触发具体方言实现（MySQL/PostgreSQL 等）                             │
-│                                                                           │
-│  2. 查询 directus_collections → 集合元数据                                 │
-│  3. 查询 directus_fields → 字段元数据                                      │
-│  4. 合并 schema + 元数据 → 构建 collections 和 fields                      │
-│                                                                           │
-│  5. RelationsService.readAll() → 关系数据                                  │
-│     └─→ schemaInspector.foreignKeys() → 数据库外键                         │
-│     └─→ 查询 directus_relations → 关系元数据                               │
-│     └─→ stitchRelations() → 合并外键与元数据                               │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         缓存设置与通知                                      │
-│                                                                           │
-│  处理者:                                                                   │
-│  1. setMemorySchemaCache(schema) → 设置内存缓存                            │
-│  2. bus.publish('schemaCache--done', { schema }) → 通知等待者              │
-│  3. lock.delete(lockKey) → 释放锁                                         │
-│                                                                           │
-│  等待者:                                                                   │
-│  1. 收到消息 → setMemorySchemaCache(options.schema)                        │
-│  2. 取消订阅 → 返回 schema                                                 │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         业务层使用 schema                                   │
-│                                                                           │
-│  req.schema 现在包含:                                                      │
-│  - collections: { [collectionName]: CollectionInfo }                      │
-│    └─→ fields: { [fieldName]: FieldInfo }                                 │
-│    └─→ primary, singleton, note, 等                                       │
-│                                                                           │
-│  - relations: Relation[]                                                   │
-│    └─→ collection, field, related_collection                               │
-│    └─→ schema: ForeignKey (数据库外键)                                     │
-│    └─→ meta: RelationMeta (Directus 元数据)                               │
-│                                                                           │
-│  使用场景:                                                                 │
-│  - 权限检查: 验证用户对 collection/field 的访问权限                         │
-│  - 查询构建: 构建正确的 SQL，处理 JOIN 和关系                               │
-│  - 响应格式化: 按照字段配置格式化输出数据                                    │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### 7.2 Schema 变更触发的刷新路径
-
-当 schema 发生变更（如添加字段、创建关系）时：
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      变更操作执行                                          │
-│  (如: POST /fields, PATCH /relations/:collection/:field)                  │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      服务层处理                                            │
-│  (FieldsService.createOne, RelationsService.createOne 等)                 │
-│                                                                           │
-│  在 finally 块中:                                                          │
-│  if (opts?.autoPurgeSystemCache !== false) {                             │
-│    await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });     │
-│  }                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   clearSystemCache() 执行                                  │
-│                                                                           │
-│  1. 获取锁 (防止并发清除)                                                  │
-│  2. systemCache.clear() → 清除系统缓存                                     │
-│  3. localSchemaCache.clear() → 清除本地 schema 缓存                        │
-│  4. memorySchemaCache = null → 清除内存缓存                                │
-│  5. clearPermissionCache() → 清除权限缓存（依赖 schema）                    │
-│  6. messenger.publish('schemaChanged', {...}) → 发布同步消息               │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    跨实例同步 (多实例场景)                                  │
-│                                                                           │
-│  Redis Pub/Sub:                                                           │
-│  实例 A ──publish('schemaChanged')──► Redis                              │
-│                                    │                                       │
-│  实例 B ◄──subscribe('schemaChanged')──┘                                  │
-│  实例 C ◄──subscribe('schemaChanged')──┘                                  │
-│  实例 D ◄──subscribe('schemaChanged')──┘                                  │
-│                                                                           │
-│  收到消息后的处理:                                                          │
-│  await localSchemaCache?.clear();                                         │
-│  memorySchemaCache = null;                                                 │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    下次请求时重新构建                                       │
-│                                                                           │
-│  下一个 HTTP 请求:                                                         │
-│  1. schema 中间件调用 getSchema()                                          │
-│  2. getMemorySchemaCache() 返回 null (已被清除)                            │
-│  3. 触发完整的构建流程                                                      │
-│  4. 获取最新的 schema                                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-## 8. 关键设计模式与架构决策
-
-### 8.1 设计模式应用
-
-| 设计模式 | 应用场景 | 实现位置 |
-|---------|---------|---------|
-| **适配器模式** | 方言适配，统一不同数据库的 schema 访问 | `SchemaInspector` 接口 + 各方言实现 |
-| **工厂模式** | 根据数据库类型创建对应的 Inspector | `createInspector()` 函数 |
-| **观察者模式** | 消息总线，跨实例通知 | `useBus()` + Redis Pub/Sub |
-| **双重检查锁** | 并发控制，单进程构建多进程等待 | `getSchema()` 中的锁 + 等待机制 |
-| **策略模式** | 不同存储后端的选择 | `useLock()`、`useBus()` 中的 Redis/本地选择 |
-
-### 8.2 关键架构决策
-
-1. **多层缓存策略**：
-   - 内存缓存（最快）+ Keyv 缓存（持久化）
-   - 权衡：速度 vs 内存使用 vs 跨实例共享
-
-2. **单进程构建 + 多进程等待**：
-   - 避免多个进程同时构建相同的 schema
-   - 权衡：锁开销 vs 重复计算浪费
-
-3. **消息总线解耦**：
-   - 构建者完成后通知等待者
-   - 变更时通知所有实例清除缓存
-   - 权衡：消息传递开销 vs 轮询开销
-
-4. **SchemaInspector 接口抽象**：
-   - 完全隔离数据库差异
-   - 新增数据库支持只需添加新的方言实现
-   - 权衡：抽象层开销 vs 可维护性
-
-5. **元数据与 schema 分离但合并使用**：
-   - 数据库 schema 是基础
-   - Directus 元数据扩展 schema
-   - 运行时合并为完整的 `SchemaOverview`
-   - 权衡：合并开销 vs 灵活性
-
-## 9. 配置参数
+## 7. 配置参数
 
 Schema 推断和缓存机制受以下环境变量影响：
 
@@ -902,70 +992,150 @@ Schema 推断和缓存机制受以下环境变量影响：
 | `CACHE_SCHEMA_FREEZE_ENABLED` | boolean | - | 是否启用 schema 冻结（防止意外修改） |
 | `CACHE_SCHEMA_MAX_ITERATIONS` | number | - | 锁计数器的最大值，防止溢出 |
 | `CACHE_SCHEMA_SYNC_TIMEOUT` | number | - | 等待其他进程构建 schema 的超时时间（毫秒） |
-| `CACHE_STORE` | string | 'memory' | 缓存存储类型：'memory' 或 'redis' |
+| `CACHE_STORE` | string | 'memory' | 缓存存储类型：'memory' 或 'redis'（**不影响 localSchemaCache**） |
 | `CACHE_NAMESPACE` | string | - | 缓存键的命名空间 |
 | `REDIS_LOCK_NAMESPACE` | string | 'directus:lock' | Redis 锁的命名空间 |
 | `REDIS_BUS_NAMESPACE` | string | 'directus:bus' | Redis 消息总线的命名空间 |
-| `SYNCHRONIZATION_STORE` | string | - | 同步管理器存储类型（用于 `SynchronizedClock`） |
 | `DB_EXCLUDE_TABLES` | array | - | 排除的表名列表，不会被 Directus 管理 |
 
-## 10. 总结
+### 7.1 关于 CACHE_STORE 的重要说明
 
-### 10.1 核心机制回顾
+| 组件 | 是否遵循 CACHE_STORE | 存储后端 |
+|------|----------------------|----------|
+| `memorySchemaCache` | ❌ 否 | **硬编码：进程内存** |
+| `localSchemaCache` | ❌ 否 | **硬编码：Keyv 内存** |
+| `systemCache` | ✅ 是 | 遵循 `CACHE_STORE` |
+| `deploymentCache` | ✅ 是 | 遵循 `CACHE_STORE` |
+| `lockCache` (useLock) | ✅ 是 | 遵循 `CACHE_STORE` |
+| `useBus()` 消息总线 | ⚠️ 部分 | 遵循 Redis 配置（通过 `redisConfigAvailable()` 检测） |
 
-Directus 的 Schema 推断机制包含以下核心组件：
+## 8. 关键纠偏总结
 
-1. **SchemaInspector 方言层**：
-   - 统一接口，多种数据库实现
-   - 第一层差异抹平，输出 `Column`、`Table`、`ForeignKey`
+### 8.1 第一处纠偏：localSchemaCache 的后端能力
 
-2. **缓存与并发控制**：
-   - 多层缓存：内存缓存 + Keyv 缓存
-   - 分布式锁：控制并发构建
-   - 消息总线：跨进程/实例通知
-   - 重试机制：最多 3 次重试 + 超时保护
+| 之前的描述 | 纠正后的事实 |
+|-----------|-------------|
+| `localSchemaCache` 支持内存或 Redis | `localSchemaCache` **硬编码使用 `'memory'`**，源码第 79 行：`getKeyvInstance('memory', ...)` |
+| 与其他缓存一样遵循 `CACHE_STORE` | 其他缓存（`systemCache`、`deploymentCache`、`lockCache`）都遵循 `CACHE_STORE`，但 `localSchemaCache` **不遵循** |
+| 用于跨实例共享 | `localSchemaCache` 是**进程内缓存**，不用于跨实例共享。跨实例同步通过 `schemaChanged` 消息总线实现 |
 
-3. **元数据合并**：
-   - `getDatabaseSchema()` 合并数据库 schema 与 Directus 元数据
-   - `stitchRelations()` 合并数据库外键与关系元数据
-   - `getLocalType()` 类型映射
+### 8.2 第二处纠偏：刷新链路的触发、失效与重建
 
-4. **跨实例同步**：
-   - `schemaChanged` 消息通知所有实例清除缓存
-   - Redis Pub/Sub 实现多实例通信
-   - 单实例时使用本地事件总线
+#### 8.2.1 触发条件
 
-### 10.2 之前描述的偏差纠正
+`clearSystemCache()` 被以下场景触发：
+- **Schema 变更**：Collections、Fields、Relations 的 CUD 操作
+- **权限变更**：Permissions、Access、Roles、Users、Policies 的变更
+- **手动触发**：`/utils/cache` 端点、`cache:clear` CLI 命令
+- **其他**：GraphQL 系统变更、AI 工具操作
 
-1. **关于"差异抹平"**：
-   - ❌ 之前：`sanitize-*` 函数是第二层差异抹平
-   - ✅ 正确：`sanitize-*` 函数是用于**快照和比较**的标准化，不是运行时的差异抹平
-   - 运行时业务层使用的是完整的 `Column` 对象，包括数据库特有属性
+#### 8.2.2 失效机制
 
-2. **关于"缓存层次"**：
-   - ❌ 之前：没有详细描述缓存机制
-   - ✅ 正确：Directus 有多层缓存，内存缓存最快，Keyv 缓存支持持久化
+`clearSystemCache()` 执行以下步骤：
+1. 清除 `systemCache`（带锁保护）
+2. 清除 `localSchemaCache`（当前实例的 Keyv 内存缓存）
+3. 清除 `memorySchemaCache`（当前实例的进程内存缓存）
+4. 清除权限缓存（依赖 schema）
+5. **发布 `schemaChanged` 消息**（跨实例同步的关键）
 
-3. **关于"并发控制"**：
-   - ❌ 之前：没有描述并发机制
-   - ✅ 正确：使用分布式锁 + 消息总线实现"单进程构建，多进程等待"
+#### 8.2.3 跨实例同步的正确理解
 
-4. **关于"跨实例同步"**：
-   - ❌ 之前：没有描述同步机制
-   - ✅ 正确：使用 `schemaChanged` 消息 + Redis Pub/Sub 实现多实例缓存同步
+| 之前的可能误解 | 纠正后的事实 |
+|---------------|-------------|
+| 缓存是跨实例共享的 | **每个实例有自己独立的缓存** |
+| 同步的是缓存数据 | **同步的是"失效信号"**，不是数据 |
+| 一个实例重建，其他实例直接用 | 每个实例**各自清除、各自重建** |
 
-### 10.3 代码位置索引
+**完整同步流程**：
+1. 实例 A 变更 → 清除自己的缓存 → 发布 `schemaChanged` 消息
+2. 实例 B、C、D 收到消息 → **各自**清除自己的缓存
+3. 下次请求时，每个实例**各自**通过 `getSchema()` 重建
+
+#### 8.2.4 两种消息总线的区别
+
+| 消息键 | 发布者 | 订阅者 | 用途 | 范围 |
+|--------|--------|--------|------|------|
+| `schemaCache--done` | `getSchema()` 中的构建者 | `getSchema()` 中的等待者 | 并发请求协调：一个构建，其他等待 | **同实例/进程内** |
+| `schemaChanged` | `clearSystemCache()` | 所有实例的订阅回调 | 缓存失效通知：一个变更，所有实例清除 | **多实例（Redis）** |
+
+#### 8.2.5 失效与重建的衔接
+
+```
+失效阶段：clearSystemCache()
+    │
+    ├─→ 只清除，不重建
+    └─→ 发布失效信号（schemaChanged）
+
+等待阶段：缓存已失效，但没有重建
+    │
+    └─→ 懒加载：重建发生在下一次请求
+
+重建阶段：下一次请求到达
+    │
+    ├─→ schema 中间件调用 getSchema()
+    ├─→ getMemorySchemaCache() 返回 undefined
+    ├─→ 竞争锁 → 一个构建，其他等待
+    ├─→ getDatabaseSchema() 实际重建
+    └─→ 设置缓存，返回 schema
+```
+
+## 9. 代码位置索引
 
 | 功能 | 文件位置 |
 |------|---------|
 | Schema 获取入口 | [api/src/utils/get-schema.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/utils/get-schema.ts) |
 | Schema 中间件 | [api/src/middleware/schema.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/middleware/schema.ts) |
-| 缓存管理 | [api/src/cache.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/cache.ts) |
+| 缓存管理（含 localSchemaCache 硬编码） | [api/src/cache.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/cache.ts) |
 | 分布式锁 | [api/src/lock/lib/use-lock.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/lock/lib/use-lock.ts) |
 | 消息总线 | [api/src/bus/lib/use-bus.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/bus/lib/use-bus.ts) |
 | 关系服务 | [api/src/services/relations.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/services/relations.ts) |
-| Schema 标准化 | [api/src/utils/sanitize-schema.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/utils/sanitize-schema.ts) |
+| Schema 标准化（用于快照/比较） | [api/src/utils/sanitize-schema.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/utils/sanitize-schema.ts) |
 | SchemaInspector 工厂 | [packages/schema/src/index.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/packages/schema/src/index.ts) |
 | MySQL 方言 | [packages/schema/src/dialects/mysql.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/packages/schema/src/dialects/mysql.ts) |
 | PostgreSQL 方言 | [packages/schema/src/dialects/postgres.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/packages/schema/src/dialects/postgres.ts) |
-| 同步管理器 | [api/src/synchronization.ts](g:/fangzheng/solo-dogfeeding/code/17734-directus/api/src/synchronization.ts) |
+
+## 10. 关键发现总结
+
+### 10.1 localSchemaCache 的硬编码问题
+
+**源码位置**：`api/src/cache.ts` 第 78-81 行
+
+```typescript
+if (localSchemaCache === null) {
+  localSchemaCache = getKeyvInstance('memory', getMilliseconds(env['CACHE_SYSTEM_TTL']), '_schema');
+  // 第一个参数是硬编码的 'memory'！
+}
+```
+
+对比其他缓存（都遵循 `CACHE_STORE`）：
+- `systemCache`: `getKeyvInstance(env['CACHE_STORE'] as Store, ...)`
+- `deploymentCache`: `getKeyvInstance(env['CACHE_STORE'] as Store, ...)`
+- `lockCache`: `getKeyvInstance(env['CACHE_STORE'] as Store, ...)`
+
+**结论**：`localSchemaCache` 是设计为进程内缓存，不支持 Redis 共享。
+
+### 10.2 跨实例同步的正确模式
+
+Directus 采用的是**"失效信号广播 + 各自重建"**的模式：
+
+1. **不共享缓存数据**：每个实例有自己独立的 `memorySchemaCache` 和 `localSchemaCache`
+2. **只同步失效信号**：通过 `schemaChanged` 消息通知所有实例"该清除缓存了"
+3. **懒加载重建**：每个实例在下次请求时各自重建自己的缓存
+
+**优点**：
+- 简单可靠：不需要复杂的缓存同步机制
+- 一致性：每个实例都从数据库获取最新数据
+- 可扩展性：不依赖共享缓存的性能
+
+**缺点**：
+- 缓存失效后，第一次请求会变慢（需要重建）
+- 高并发场景下，可能出现多个实例同时重建（但通过 `useLock()` 缓解）
+
+### 10.3 两种消息总线的分工
+
+| 场景 | 使用的消息 | 作用 |
+|------|-----------|------|
+| 多个请求同时到达，缓存已失效 | `schemaCache--done` | 协调并发请求：一个构建，其他等待结果 |
+| 一个实例变更了 schema | `schemaChanged` | 通知所有实例清除缓存，准备重建 |
+
+这两种消息配合使用，实现了完整的并发控制和跨实例同步。
