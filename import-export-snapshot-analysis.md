@@ -1120,7 +1120,248 @@ await transaction(database, async (trx) => {
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.5 边界清晰划分
+### 7.5 边界情况与可靠性分析
+
+#### 7.5.1 Schema Diff 无差异时的 HTTP 返回
+
+**关键代码** (`controllers/schema.ts:109-110`)：
+
+```typescript
+const snapshotDiff = await service.diff(snapshot, { currentSnapshot, force: 'force' in req.query });
+if (!snapshotDiff) return next();
+```
+
+**返回行为**：
+
+| 场景 | HTTP 状态码 | 响应体 | 说明 |
+|------|-------------|--------|------|
+| 有差异 | 200 OK | `{ data: { hash: "...", diff: {...} } }` | 返回差异内容 |
+| 无差异 | 204 No Content | 空 | `return next()` 不设置 `res.locals['payload']`，respond 中间件返回 204 |
+
+**服务层逻辑** (`services/schema.ts:59-66`)：
+
+```typescript
+async diff(snapshot: Snapshot, options?: {...}): Promise<SnapshotDiff | null> {
+    // ...
+    const diff = getSnapshotDiff(currentSnapshot, snapshot);
+
+    if (
+        diff.collections.length === 0 &&
+        diff.fields.length === 0 &&
+        diff.relations.length === 0 &&
+        (!diff.systemFields || diff.systemFields.length === 0)
+    ) {
+        return null;  // 无差异时返回 null
+    }
+
+    return diff;
+}
+```
+
+**注意事项**：
+- 无差异时返回 `204 No Content`，客户端需要正确处理这种情况
+- 这不是错误，而是表示当前 schema 与快照完全一致
+
+---
+
+#### 7.5.2 导入导出通知触发条件
+
+**通知触发的必要条件**：
+
+| 操作 | 触发条件 | 不触发的场景 |
+|------|----------|--------------|
+| **导入 (后台模式)** | 1. `background=true`<br>2. `this.accountability?.user` 存在 | 1. `background=false` (同步模式)<br>2. 无用户上下文 (如 API token 无 user) |
+| **导出** | 1. `this.accountability?.user` 存在 | 1. 无用户上下文 |
+
+**关键代码分析**：
+
+**导入通知条件** (`services/import-export.ts:290-330`)：
+
+```typescript
+if (options?.background) {
+    const notify = async (subject: string, message: string) => {
+        try {
+            if (!this.accountability?.user) return;  // 无用户则不通知
+            // ... 发送通知
+        } catch (error) {
+            logger.error(error, `Failed to notify user`);
+        }
+    };
+
+    promise
+        .then(async () => {
+            await notify('Your import has been successful', ...);
+        })
+        .catch(async (error) => {
+            await notify('Your import has failed', ...);
+        })
+        .finally(async () => await decrementImportCount());
+}
+// 同步模式 (background=false) 没有 notify 调用
+```
+
+**导出通知条件** (`services/import-export.ts:777-780`, `810-812`)：
+
+```typescript
+// 成功通知
+if (this.accountability?.user) {
+    // ... 发送 "导出就绪" 通知
+}
+
+// 失败通知
+if (this.accountability?.user) {
+    // ... 发送 "导出失败" 通知
+}
+```
+
+**无用户上下文的场景**：
+- 使用静态 API Token（没有绑定用户）
+- 系统内部调用（无 accountability）
+- CLI 直接调用服务（无 HTTP 请求上下文）
+
+**无通知时的替代方案**：
+- 同步导入：通过 HTTP 响应状态码和错误信息了解结果
+- 导出：检查 `directus_files` 表是否有新文件
+- 查看系统日志 (`logger.error` 会记录失败)
+
+---
+
+#### 7.5.3 ImportCount 计数可靠性边界
+
+**计数生命周期**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         importCount 计数生命周期                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  递增时机 (import-export.ts:256-263)                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  权限校验通过后                                                        │   │
+│  │  文件解析开始前                                                        │   │
+│  │                                                                       │   │
+│  │  const limitReached = await store(async (store) => {                 │   │
+│  │      const count = (await store.get('importCount')) ?? 0;           │   │
+│  │      if (count >= Number(env['IMPORT_MAX_CONCURRENCY'])) return true;│   │
+│  │      await store.set('importCount', count + 1);  // ← 递增           │   │
+│  │      return false;                                                     │   │
+│  │  });                                                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                       │
+│                                      ▼                                       │
+│  递减时机                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  后台模式 (background=true):                                           │   │
+│  │  promise.finally(async () => await decrementImportCount());          │   │
+│  │                                                                       │   │
+│  │  同步模式 (background=false):                                          │   │
+│  │  try { await promise; }                                               │   │
+│  │  finally { await decrementImportCount(); }  // ← 递减               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**递减实现** (`services/import-export.ts:273-282`)：
+
+```typescript
+const decrementImportCount = async () => {
+    try {
+        await store(async (store) => {
+            const count = (await store.get('importCount')) ?? 0;
+            await store.set('importCount', count - 1);
+        });
+    } catch (error) {
+        logger.error(error, `Failed to decrement importCount`);
+    }
+};
+```
+
+**计数滞留的风险场景**：
+
+| 风险场景 | 原因分析 | 后果 |
+|----------|----------|------|
+| **进程崩溃/重启** | 后台任务的 `.finally()` 不会执行 | 计数永远不会递减 |
+| **Redis 连接中断** | `store` 操作失败，递减失败 | 计数滞留，日志记录错误 |
+| **IMPORT_TIMEOUT 过期** | TTL 触发，计数被清除 | 计数重置为初始状态 |
+| **未捕获的异常** | 极端情况下 finally 可能不执行 | 计数滞留 |
+
+**计数滞留的后果**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      importCount 滞留的连锁反应                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  正常情况:                                                                    │
+│  importCount = 0 → 开始导入 → +1 → 完成 → -1 → importCount = 0            │
+│                                                                              │
+│  滞留情况 (进程崩溃):                                                         │
+│  importCount = 0 → 开始导入 → +1 → [进程崩溃] → importCount = 1 (滞留)    │
+│                                                                              │
+│  后续影响:                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  场景 1: IMPORT_MAX_CONCURRENCY = 1                                  │   │
+│  │  滞留计数 = 1                                                         │   │
+│  │  后续导入: count (1) >= 1 → 抛出 LimitExceededError                 │   │
+│  │  结果: 所有导入都被拒绝 ❌                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  场景 2: IMPORT_MAX_CONCURRENCY = 5                                  │   │
+│  │  滞留计数 = 3 (多次崩溃)                                             │   │
+│  │  可用并发 = 5 - 3 = 2 (实际可用减少)                                │   │
+│  │  结果: 并发能力下降 ⚠️                                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**存储机制与 TTL** (`services/import-export.ts:203-205`)：
+
+```typescript
+const store = useStore<{ importCount: number | undefined }>(
+    String(env['IMPORT_EXPORT_NAMESPACE']),
+    {
+        ttl: ms((env['IMPORT_TIMEOUT'] as StringValue) ?? '1h'),  // 默认 1 小时 TTL
+    },
+);
+```
+
+**恢复机制**：
+
+| 恢复方式 | 说明 | 适用场景 |
+|----------|------|----------|
+| **TTL 自动过期** | 默认 1 小时后计数被清除 | 等待恢复 |
+| **重启应用** | 本地内存存储会重置 | 仅适用于本地内存模式 |
+| **手动清理 Redis** | 清除 `IMPORT_EXPORT_NAMESPACE` 下的键 | Redis 模式，需要运维操作 |
+| **调整 IMPORT_MAX_CONCURRENCY** | 临时提高限制绕过阻塞 | 紧急恢复 |
+
+**代码层面的保护**：
+
+```typescript
+// decrementImportCount 使用 try-catch，确保不会因存储错误影响主流程
+const decrementImportCount = async () => {
+    try {
+        await store(async (store) => {
+            const count = (await store.get('importCount')) ?? 0;
+            await store.set('importCount', count - 1);
+        });
+    } catch (error) {
+        // 仅记录错误，不抛出
+        logger.error(error, `Failed to decrement importCount`);
+    }
+};
+```
+
+**注意事项**：
+- 计数只是**并发控制**，不是任务追踪
+- 即使计数滞留，已完成的导入数据不会受影响（已提交的事务已持久化）
+- TTL 机制提供了最终的安全网
+
+---
+
+### 7.6 边界清晰划分
 
 | 维度 | 数据导入导出 | Schema Snapshot |
 |------|-------------|-----------------|
@@ -1128,7 +1369,8 @@ await transaction(database, async (trx) => {
 | **为什么** | 业务数据的迁移、备份、集成 | 环境同步、版本控制、自动化部署 |
 | **怎么做** | 流式解析 + 队列处理 + **全有或全无事务** + 错误报告 | 快照对比 + diff 计算 + 全有或全无事务 |
 | **谁来做** | 业务用户 (基于角色权限) | 系统管理员 / DevOps |
-| **状态反馈** | HTTP 响应 + 站内通知 (后台) | HTTP 响应 + CLI 控制台输出 |
+| **状态反馈** | HTTP 响应 + 站内通知 (后台模式，有用户时) | HTTP 响应 + CLI 控制台输出 |
+| **边界情况** | 无用户时无通知、计数可能滞留 | 无差异返回 204、无通知机制 |
 
 这种清晰的边界划分使得 Directus 能够同时满足：
 - **业务用户**：灵活、可靠的数据操作需求（事务保证）
