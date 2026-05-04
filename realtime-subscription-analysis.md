@@ -591,6 +591,493 @@ SubscribeHandler.dispatch() 遍历 articles 的订阅
 
 ---
 
+---
+
+## 附录 A：权限过滤与错误处理的两条路径
+
+### 关键发现：`readOne` vs `readMany` 的行为差异
+
+在深入分析代码后，发现权限过滤有**两条不同的路径**，取决于订阅方式和事件类型。
+
+#### 1. `readOne` 的行为（抛出异常）
+
+**代码位置**：`api/src/services/items.ts:587-607`
+
+```typescript
+async readOne(key: PrimaryKey, query: Query = {}, opts?: QueryOptions): Promise<Item> {
+    // ...
+    let results: Item[] = [];
+
+    if (query.version && query.version !== 'main') {
+        results = [await handleVersion(this, key, queryWithKey, opts)];
+    } else {
+        results = await this.readByQuery(queryWithKey, opts);
+    }
+
+    // 关键：如果结果为空，抛出 ForbiddenError
+    if (results.length === 0) {
+        throw new ForbiddenError();
+    }
+
+    return results[0]!;
+}
+```
+
+**行为特点**：
+- 如果 `readByQuery` 返回空数组（数据被权限过滤掉）
+- `readOne` 会**抛出 `ForbiddenError`**
+- 无论是"没有权限"还是"数据被过滤"，都会抛出相同的异常
+
+#### 2. `readMany` 的行为（不抛出异常）
+
+**代码位置**：`api/src/services/items.ts:614-629`
+
+```typescript
+async readMany(keys: PrimaryKey[], query: Query = {}, opts?: QueryOptions): Promise<Item[]> {
+    // ...
+    const results = await this.readByQuery(queryWithKey, opts);
+
+    // 关键：直接返回结果，不检查是否为空
+    return results;
+}
+```
+
+**行为特点**：
+- 如果 `readByQuery` 返回空数组（数据被权限过滤掉）
+- `readMany` 会**直接返回空数组**，不抛出异常
+- 调用者需要自行检查结果是否为空
+
+#### 3. `getItemsPayload` 中的调用路径
+
+**代码位置**：`api/src/websocket/utils/items.ts:139-168`
+
+```typescript
+export async function getItemsPayload(
+    subscription: PSubscription,
+    accountability: Accountability | null,
+    schema: SchemaOverview,
+    event?: WebSocketEvent,
+) {
+    const query = subscription.query ?? {};
+    const service = getService(subscription.collection, { schema, accountability });
+
+    if ('item' in subscription) {
+        // 路径 1：订阅特定 item
+        if (event?.action === 'delete') {
+            return subscription.item;  // delete 事件特殊处理
+        } else {
+            // create/update 事件 → readOne → 可能抛出 ForbiddenError
+            return await service.readOne(subscription.item, query);
+        }
+    }
+
+    switch (event?.action) {
+        case 'create':
+            // 路径 2：create 事件 → readMany → 返回空数组不抛异常
+            return await service.readMany([event.key], query);
+        case 'update':
+            // 路径 2：update 事件 → readMany → 返回空数组不抛异常
+            return await service.readMany(event.keys, query);
+        case 'delete':
+            // 路径 3：delete 事件 → 直接返回 keys，不查数据库
+            return event.keys;
+        case undefined:
+        default:
+            // 路径 4：初始数据加载 → readByQuery → 返回空数组不抛异常
+            return await service.readByQuery(query);
+    }
+}
+```
+
+---
+
+### 路径 A：无数据被过滤（静默跳过）
+
+#### 触发条件
+
+| 订阅方式 | 事件类型 | 调用的方法 | 行为 |
+|---------|---------|-----------|------|
+| 非特定 item 订阅 | create | `readMany([event.key])` | 返回空数组，不抛异常 |
+| 非特定 item 订阅 | update | `readMany(event.keys)` | 返回空数组，不抛异常 |
+| 任意订阅 | 初始加载（无事件） | `readByQuery()` | 返回空数组，不抛异常 |
+
+#### 发生的场景
+
+**场景 1：数据被权限过滤器过滤**
+- 数据存在于数据库中
+- 用户有该 collection 的读取权限
+- 但权限条件（如 `status = 'published'`）不匹配该数据
+- `processAst` 中的 `injectCases` 注入权限过滤条件
+- SQL 查询返回空结果
+- `readMany` / `readByQuery` 返回空数组
+
+**场景 2：用户完全没有读取权限**
+- `fetchPermissions` 返回空数组
+- `validatePathPermissions` 可能抛出异常（取决于具体实现）
+- 或者 `injectCases` 注入的条件导致没有结果
+- `readMany` / `readByQuery` 返回空数组
+
+#### 处理流程
+
+```
+getPayload() 被调用
+    ↓
+readMany() / readByQuery() 执行
+    ↓
+processAst 注入权限过滤条件
+    ↓
+SQL 查询返回空结果
+    ↓
+readMany() / readByQuery() 返回空数组 []
+    ↓
+getPayload() 返回 { event: 'create', data: [] }
+    ↓
+dispatch() 中的检查：
+if (Array.isArray(result?.['data']) && result?.['data']?.length === 0) continue;
+    ↓
+continue 跳过该订阅
+    ↓
+[结果] 不发送任何消息给客户端
+```
+
+**代码位置**：`api/src/websocket/handlers/subscribe.ts:108-135`
+
+```typescript
+async dispatch(event: WebSocketEvent) {
+    // ...
+    for (const subscription of subscriptions) {
+        try {
+            const result = await getPayload(subscription, client.accountability, schema, event);
+
+            // 路径 A 的关键检查：空数组则跳过
+            if (Array.isArray(result?.['data']) && result?.['data']?.length === 0) continue;
+
+            client.send(fmtMessage('subscription', result, subscription.uid));
+        } catch (err) {
+            // 路径 B：异常处理
+            handleWebSocketError(client, err, 'subscribe');
+        }
+    }
+}
+```
+
+#### 客户端收到的消息
+
+**无消息** - 客户端完全收不到任何通知。
+
+---
+
+### 路径 B：权限错误（发送错误消息）
+
+#### 触发条件
+
+| 订阅方式 | 事件类型 | 调用的方法 | 行为 |
+|---------|---------|-----------|------|
+| 特定 item 订阅 (`'item' in subscription`) | create | `readOne(subscription.item)` | 空结果抛出 `ForbiddenError` |
+| 特定 item 订阅 (`'item' in subscription`) | update | `readOne(subscription.item)` | 空结果抛出 `ForbiddenError` |
+
+#### 发生的场景
+
+**场景 1：数据不存在**
+- 数据在数据库中不存在（可能已被删除）
+- `readByQuery` 返回空数组
+- `readOne` 检查 `results.length === 0` → 抛出 `ForbiddenError`
+
+**场景 2：用户没有读取权限**
+- `fetchPermissions` 返回空数组
+- `validatePathPermissions` 抛出异常
+- 或者 `injectCases` 注入的条件导致没有结果
+- `readOne` 检查 `results.length === 0` → 抛出 `ForbiddenError`
+
+**场景 3：数据被权限过滤器过滤**
+- 数据存在，但权限条件不匹配
+- `readByQuery` 返回空数组
+- `readOne` 检查 `results.length === 0` → 抛出 `ForbiddenError`
+
+**重要**：`readOne` 无法区分这三种场景，都会抛出相同的 `ForbiddenError`。
+
+#### 处理流程
+
+```
+getPayload() 被调用
+    ↓
+readOne() 执行
+    ↓
+processAst 注入权限过滤条件
+    ↓
+SQL 查询返回空结果（或抛出异常）
+    ↓
+readOne() 检查 results.length === 0
+    ↓
+抛出 ForbiddenError
+    ↓
+dispatch() 中的 try-catch 捕获异常
+    ↓
+进入 catch 块：handleWebSocketError(client, err, 'subscribe')
+    ↓
+ForbiddenError 转换为 WebSocket 错误消息
+    ↓
+[结果] 发送错误消息给客户端
+```
+
+**错误处理代码**：`api/src/websocket/errors.ts:51-71`
+
+```typescript
+export function handleWebSocketError(client: WebSocketClient | WebSocket, error: unknown, type?: string): void {
+    const logger = useLogger();
+
+    if (isDirectusError(error)) {
+        // ForbiddenError 是 DirectusError，走这个分支
+        client.send(WebSocketError.fromError(error, type).toMessage());
+        return;
+    }
+
+    if (error instanceof WebSocketError) {
+        client.send(error.toMessage());
+        return;
+    }
+    // ...
+}
+```
+
+**WebSocketError 格式**：`api/src/websocket/errors.ts:9-48`
+
+```typescript
+export class WebSocketError extends Error {
+    type: string;
+    code: string;
+    uid: string | number | undefined;
+
+    toJSON(): WebSocketResponse {
+        const message: WebSocketResponse = {
+            type: this.type,
+            status: 'error',
+            error: {
+                code: this.code,
+                message: this.message,
+            },
+        };
+
+        if (this.uid !== undefined) {
+            message.uid = this.uid;
+        }
+
+        return message;
+    }
+    // ...
+}
+```
+
+#### 客户端收到的消息
+
+**ForbiddenError 转换后的消息格式**：
+
+```json
+{
+    "type": "subscribe",
+    "status": "error",
+    "error": {
+        "code": "FORBIDDEN",
+        "message": "You don't have permission to access this."
+    },
+    "uid": "subscription-uid-123"  // 如果订阅有 uid
+}
+```
+
+**消息字段说明**：
+
+| 字段 | 值 | 说明 |
+|-----|---|------|
+| `type` | `"subscribe"` | 错误类型，来自 `handleWebSocketError` 的第三个参数 |
+| `status` | `"error"` | 固定值，表示这是错误消息 |
+| `error.code` | `"FORBIDDEN"` | 来自 `ForbiddenError` 的 `ErrorCode.Forbidden` |
+| `error.message` | `"You don't have permission to access this."` | 来自 `ForbiddenError` 的默认消息 |
+| `uid` | 订阅的 uid | 只有订阅时指定了 uid 才会有 |
+
+---
+
+### 路径 A vs 路径 B 对比总结
+
+| 维度 | 路径 A：无数据被过滤 | 路径 B：权限错误 |
+|-----|---------------------|-----------------|
+| **触发条件** | 非特定 item 订阅 + create/update/初始加载 | 特定 item 订阅 + create/update |
+| **调用方法** | `readMany()` / `readByQuery()` | `readOne()` |
+| **空结果处理** | 返回空数组 `[]` | 抛出 `ForbiddenError` |
+| **dispatch 处理** | `if (data.length === 0) continue` | `catch` 块捕获异常 |
+| **客户端行为** | 收不到任何消息（静默跳过） | 收到错误消息 |
+| **错误消息格式** | 无 | `{ type: "subscribe", status: "error", error: { code: "FORBIDDEN", ... } }` |
+
+---
+
+### 特殊情况：delete 事件
+
+**代码位置**：`api/src/websocket/utils/items.ts:143-145, 159-161`
+
+```typescript
+if ('item' in subscription) {
+    if (event?.action === 'delete') {
+        return subscription.item;  // 直接返回，不查数据库
+    }
+    // ...
+}
+
+switch (event?.action) {
+    case 'delete':
+        return event.keys;  // 直接返回 keys，不查数据库
+    // ...
+}
+```
+
+**delete 事件的特殊行为**：
+- 不经过 `readOne` / `readMany` / `readByQuery`
+- 直接返回 `subscription.item` 或 `event.keys`
+- **不会触发权限过滤**
+- 订阅者会收到 delete 事件，即使他们可能没有权限读取该数据
+
+**delete 事件的消息格式**：
+
+```json
+{
+    "type": "subscription",
+    "event": "delete",
+    "data": [1, 2, 3],  // 被删除的主键
+    "uid": "subscription-uid-123"
+}
+```
+
+---
+
+### 完整决策流程图
+
+```
+                    事件到达 dispatch()
+                           ↓
+                    遍历所有订阅
+                           ↓
+                    事件类型匹配？
+                    /           \
+                  否             是
+                  ↓              ↓
+              [跳过]        item 过滤？
+                            /         \
+                          否           是
+                          ↓            ↓
+                      [继续]        匹配？
+                                    /    \
+                                  否      是
+                                  ↓       ↓
+                              [跳过]   事件类型？
+                                      /   |   \
+                                create update delete
+                                    \   |   /
+                                     ↓ ↓ ↓
+                               订阅特定 item？
+                               /             \
+                             是               否
+                             ↓                 ↓
+                        readOne()        readMany()/readByQuery()
+                             ↓                 ↓
+                        空结果？           空数组？
+                        /      \          /       \
+                      是        否       否         是
+                      ↓         ↓       ↓           ↓
+                ForbiddenError  发送消息  发送消息   continue
+                      ↓                              ↓
+                catch 块                        [静默跳过]
+                      ↓
+              handleWebSocketError
+                      ↓
+                发送错误消息
+```
+
+---
+
+## 附录 B：消息格式完整参考
+
+### 1. 正常订阅消息
+
+**Create 事件**：
+```json
+{
+    "type": "subscription",
+    "event": "create",
+    "data": [
+        {
+            "id": 1,
+            "title": "Test Article",
+            "status": "published",
+            "created_at": "2026-05-04T10:00:00Z"
+        }
+    ],
+    "uid": "my-subscription-1"
+}
+```
+
+**Update 事件**：
+```json
+{
+    "type": "subscription",
+    "event": "update",
+    "data": [
+        {
+            "id": 1,
+            "title": "Updated Title",
+            "status": "published"
+        }
+    ],
+    "uid": "my-subscription-1"
+}
+```
+
+**Delete 事件**：
+```json
+{
+    "type": "subscription",
+    "event": "delete",
+    "data": [1, 2, 3],
+    "uid": "my-subscription-1"
+}
+```
+
+**初始数据（订阅时未指定 event 类型）**：
+```json
+{
+    "type": "subscription",
+    "event": "init",
+    "data": [
+        { "id": 1, "title": "Article 1" },
+        { "id": 2, "title": "Article 2" }
+    ],
+    "uid": "my-subscription-1"
+}
+```
+
+### 2. 错误消息
+
+**ForbiddenError（路径 B）**：
+```json
+{
+    "type": "subscribe",
+    "status": "error",
+    "error": {
+        "code": "FORBIDDEN",
+        "message": "You don't have permission to access this."
+    },
+    "uid": "my-subscription-1"
+}
+```
+
+**其他可能的错误**：
+
+| 错误码 | 场景 | 消息示例 |
+|-------|------|---------|
+| `FORBIDDEN` | 没有权限访问 | `"You don't have permission to access this."` |
+| `INVALID_COLLECTION` | 订阅的 collection 不存在 | `"The provided collection does not exists or is not accessible."` |
+| `INVALID_PAYLOAD` | 消息格式错误 | `"Unable to parse the incoming message."` |
+| `REQUESTS_EXCEEDED` | 触发限流 | `"Too many messages, retry after 1000ms."` |
+
+---
+
 ## 总结
 
 ### 核心协作机制
@@ -610,6 +1097,13 @@ SubscribeHandler.dispatch() 遍历 articles 的订阅
 - **T4**：事件通过消息总线发布
 - **T5-T11**：事件分发和权限裁剪（使用订阅客户端权限）
 
+### 权限过滤的两条关键路径
+
+| 路径 | 触发条件 | 客户端行为 | 消息格式 |
+|-----|---------|-----------|---------|
+| **路径 A** | 非特定 item 订阅 + create/update/初始加载 | 静默跳过，收不到任何消息 | 无 |
+| **路径 B** | 特定 item 订阅 + create/update | 收到错误消息 | `{ type: "subscribe", status: "error", error: { code: "FORBIDDEN" } }` |
+
 ### 设计亮点
 
 1. **职责分离**：写入权限和读取权限完全分离
@@ -617,3 +1111,18 @@ SubscribeHandler.dispatch() 遍历 articles 的订阅
 3. **按需读取**：每个订阅客户端独立读取，确保权限隔离
 4. **多实例友好**：通过消息总线实现跨实例事件分发
 5. **细粒度控制**：支持 collection 级别、item 级别、event 类型级别的过滤
+
+### 潜在的设计权衡
+
+1. **readOne vs readMany 行为不一致**：
+   - `readOne` 空结果抛出异常
+   - `readMany` 空结果返回空数组
+   - 这种不一致可能导致调试困难
+
+2. **delete 事件不进行权限过滤**：
+   - 订阅者可能收到他们无权读取的数据的删除通知
+   - 这是一个潜在的信息泄露风险
+
+3. **静默跳过 vs 错误消息**：
+   - 路径 A 的静默跳过可能让客户端困惑（为什么收不到通知？）
+   - 路径 B 的错误消息可能暴露敏感信息（虽然 `ForbiddenError` 消息比较通用）
