@@ -244,6 +244,416 @@ export function getService(collection: string, opts: AbstractServiceOptions): It
 
 ---
 
+## 二、补充：系统集合在 REST 与 GraphQL 中的入口差异
+
+### 2.4 系统集合的特殊处理
+
+Directus 中的系统集合（以 `directus_` 为前缀）在 REST 和 GraphQL 中有不同的入口设计，但最终都通过 `getService()` 工厂函数统一到相同的服务调用链。
+
+#### REST 中的系统集合处理
+
+**独立控制器设计**：
+
+系统集合在 REST 层有独立的控制器文件，每个系统集合都有专门的路由定义：
+
+```
+api/src/controllers/
+├── access.ts           # directus_access
+├── activity.ts         # directus_activity
+├── comments.ts         # directus_comments
+├── dashboards.ts       # directus_dashboards
+├── deployment.ts       # directus_deployments
+├── deployment-webhooks.ts  # directus_deployment_webhooks
+├── fields.ts           # directus_fields
+├── files.ts            # directus_files
+├── flows.ts            # directus_flows
+├── folders.ts          # directus_folders
+├── notifications.ts    # directus_notifications
+├── operations.ts       # directus_operations
+├── panels.ts           # directus_panels
+├── permissions.ts      # directus_permissions
+├── policies.ts         # directus_policies
+├── presets.ts          # directus_presets
+├── relations.ts        # directus_relations
+├── revisions.ts        # directus_revisions
+├── roles.ts            # directus_roles
+├── settings.ts         # directus_settings
+├── shares.ts           # directus_shares
+├── translations.ts     # directus_translations
+├── users.ts            # directus_users
+└── versions.ts         # directus_versions
+```
+
+**Users 控制器示例** (`controllers/users.ts`):
+
+```typescript
+const router = express.Router();
+
+// 使用 useCollection 中间件设置集合上下文
+router.use(useCollection('directus_users'));
+
+// 独立的路由定义
+router.post('/', asyncHandler(async (req, res, next) => {
+    // 直接实例化专门的 UsersService，而非通用 ItemsService
+    const service = new UsersService({
+        accountability: req.accountability,
+        schema: req.schema,
+    });
+
+    if (Array.isArray(req.body)) {
+        const keys = await service.createMany(req.body);
+        savedKeys.push(...keys);
+    } else {
+        const key = await service.createOne(req.body);
+        savedKeys.push(key);
+    }
+    // ...
+}));
+
+// 系统集合特有的额外端点
+router.post('/invite', asyncHandler(async (req, _res, next) => {
+    const service = new UsersService({
+        accountability: req.accountability,
+        schema: req.schema,
+    });
+    // 邀请用户 - UsersService 特有的方法
+    await service.inviteUser(req.body.email, req.body.role, req.body.invite_url || null);
+    return next();
+}));
+
+router.post('/me/tfa/generate/', asyncHandler(async (req, res, next) => {
+    const service = new TFAService({
+        accountability: req.accountability,
+        schema: req.schema,
+    });
+    // 双因素认证相关操作
+    const { url, secret } = await service.generateTFA(req.accountability.user, requiresPassword);
+    res.locals['payload'] = { data: { secret, otpauth_url: url } };
+}));
+```
+
+**Files 控制器示例** (`controllers/files.ts`):
+
+```typescript
+const router = express.Router();
+router.use(useCollection('directus_files'));
+
+// 文件上传特有端点 - multipart/form-data 处理
+router.post('/', asyncHandler(multipartHandler), asyncHandler(async (req, res, next) => {
+    const service = new FilesService({
+        accountability: req.accountability,
+        schema: req.schema,
+    });
+
+    let keys: PrimaryKey | PrimaryKey[] = [];
+
+    if (req.is('multipart/form-data')) {
+        keys = res.locals['savedFiles'];
+    } else {
+        keys = await service.createOne(req.body);
+    }
+    // ...
+}));
+
+// 文件导入特有端点
+router.post('/import', asyncHandler(async (req, res, next) => {
+    const service = new FilesService({
+        accountability: req.accountability,
+        schema: req.schema,
+    });
+    const primaryKey = await service.importOne(req.body.url, req.body.data, req.body.options);
+    // ...
+}));
+```
+
+**Activity 控制器示例** (`controllers/activity.ts`):
+
+```typescript
+const router = express.Router();
+router.use(useCollection('directus_activity'));
+
+// Activity 是只读集合，只有查询端点
+const readHandler = asyncHandler(async (req, res, next) => {
+    const service = new ActivityService({
+        accountability: req.accountability,
+        schema: req.schema,
+    });
+    // ...
+});
+
+router.search('/', validateBatch('read'), readHandler, respond);
+router.get('/', readHandler, respond);
+router.get('/:pk', asyncHandler(async (req, res, next) => {
+    const service = new ActivityService({
+        accountability: req.accountability,
+        schema: req.schema,
+    });
+    const record = await service.readOne(req.params['pk']!, req.sanitizedQuery);
+    res.locals['payload'] = { data: record || null };
+    return next();
+}), respond);
+
+// 没有 POST/PATCH/DELETE 端点 - 只读
+```
+
+**REST 系统集合控制器特点**：
+
+| 特点 | 说明 |
+|------|------|
+| **独立路由文件** | 每个系统集合有自己的 `controllers/*.ts` 文件 |
+| **useCollection 中间件** | 设置 `req.collection` 上下文 |
+| **直接实例化专门 Service** | `new UsersService()` 而非 `new ItemsService()` |
+| **额外业务端点** | 如 `/users/invite`、`/users/me/tfa/generate` |
+| **只读限制** | 部分集合（如 activity）只暴露 GET 端点 |
+
+#### GraphQL 中的系统集合处理
+
+**Scope 隔离设计**：
+
+GraphQL 通过 `scope` 概念将系统集合与普通集合完全隔离，有独立的访问端点：
+
+```typescript
+// services/graphql/schema/index.ts
+
+// 系统集合黑名单 - 这些集合完全不暴露在 GraphQL 中
+export const SYSTEM_DENY_LIST = [
+    'directus_collections',
+    'directus_fields',
+    'directus_relations',
+    'directus_migrations',
+    'directus_sessions',
+    'directus_extensions',
+];
+
+// 只读系统集合
+export const READ_ONLY = ['directus_activity', 'directus_revisions'];
+
+// Scope 过滤器 - 根据 scope 决定暴露哪些集合
+const scopeFilter = (collection: SchemaOverview['collections'][string]) => {
+    // items scope: 只暴露非系统集合
+    if (gql.scope === 'items' && isSystemCollection(collection.collection)) 
+        return false;
+
+    // system scope: 只暴露系统集合（排除黑名单）
+    if (gql.scope === 'system') {
+        if (isSystemCollection(collection.collection) === false) 
+            return false;
+        if (SYSTEM_DENY_LIST.includes(collection.collection)) 
+            return false;
+    }
+
+    return true;
+};
+```
+
+**集合命名转换**：
+
+```typescript
+// 生成 Schema 时的集合名处理
+const readableCollections = Object.values(schema.read.collections)
+    .filter((collection) => collection.collection in ReadCollectionTypes)
+    .filter(scopeFilter);
+
+if (readableCollections.length > 0) {
+    schemaComposer.Query.addFields(
+        readableCollections.reduce(
+            (acc, collection) => {
+                // 集合名转换：
+                // - items scope: 直接使用原名 (如 'articles')
+                // - system scope: 去掉 'directus_' 前缀 (如 'users' 而非 'directus_users')
+                const collectionName = gql.scope === 'items' 
+                    ? collection.collection 
+                    : collection.collection.substring(9);
+                
+                acc[collectionName] = ReadCollectionTypes[collection.collection]!.getResolver(collection.collection);
+
+                // 非单例集合添加额外查询
+                if (gql.schema.collections[collection.collection]!.singleton === false) {
+                    // 添加 by_id 查询
+                    acc[`${collectionName}_by_id`] = ReadCollectionTypes[collection.collection]!.getResolver(
+                        `${collection.collection}_by_id`,
+                    );
+                    // 添加 aggregated 聚合查询
+                    acc[`${collectionName}_aggregated`] = ReadCollectionTypes[collection.collection]!.getResolver(
+                        `${collection.collection}_aggregated`,
+                    );
+                }
+
+                return acc;
+            },
+            {} as ObjectTypeComposerFieldConfigAsObjectDefinition<any, any>,
+        ),
+    );
+}
+```
+
+**Mutation 端点的只读限制**：
+
+```typescript
+// 只有不在 READ_ONLY 列表中的集合才生成 Mutation 端点
+if (Object.keys(schema.create.collections).length > 0) {
+    schemaComposer.Mutation.addFields(
+        Object.values(schema.create.collections)
+            .filter((collection) => collection.collection in CreateCollectionTypes && collection.singleton === false)
+            .filter(scopeFilter)
+            // 关键：过滤掉只读集合
+            .filter((collection) => READ_ONLY.includes(collection.collection) === false)
+            .reduce(
+                (acc, collection) => {
+                    const collectionName = gql.scope === 'items' 
+                        ? collection.collection 
+                        : collection.collection.substring(9);
+
+                    acc[`create_${collectionName}_items`] = CreateCollectionTypes[collection.collection]!.getResolver(
+                        `create_${collection.collection}_items`,
+                    );
+                    acc[`create_${collectionName}_item`] = CreateCollectionTypes[collection.collection]!.getResolver(
+                        `create_${collection.collection}_item`,
+                    );
+
+                    return acc;
+                },
+                {} as ObjectTypeComposerFieldConfigAsObjectDefinition<any, any>,
+            ),
+    );
+}
+```
+
+**查询解析器中的集合名还原**：
+
+```typescript
+// services/graphql/resolvers/query.ts
+export async function resolveQuery(gql: GraphQLService, info: GraphQLResolveInfo) {
+    let collection = info.fieldName;
+    
+    // 关键：system scope 下需要还原 'directus_' 前缀
+    // GraphQL 查询字段名是 'users'，实际集合名是 'directus_users'
+    if (gql.scope === 'system') 
+        collection = `directus_${collection}`;
+    
+    // 后续通过 getService() 获取正确的服务
+    // ...
+}
+
+// services/graphql/resolvers/mutation.ts
+export async function resolveMutation(gql: GraphQLService, args, info) {
+    const action = info.fieldName.split('_')[0] as 'create' | 'update' | 'delete';
+    let collection = info.fieldName.substring(action.length + 1);
+    
+    // 同样需要还原前缀
+    if (gql.scope === 'system') 
+        collection = `directus_${collection}`;
+    
+    // 通过 getService() 获取服务
+    const service = getService(collection, {
+        knex: gql.knex,
+        accountability: gql.accountability,
+        schema: gql.schema,
+    });
+    // ...
+}
+```
+
+**GraphQL 系统集合特点**：
+
+| 特点 | 说明 |
+|------|------|
+| **Scope 隔离** | 普通集合走 `/graphql`，系统集合走 `/graphql/system` |
+| **命名转换** | 查询字段名去掉 `directus_` 前缀，解析时再还原 |
+| **黑名单机制** | `SYSTEM_DENY_LIST` 中的集合完全不暴露 |
+| **只读限制** | `READ_ONLY` 列表中的集合不生成 Mutation |
+| **统一服务获取** | 通过 `getService()` 工厂函数获取服务 |
+
+#### 最终统一到相同服务调用链
+
+无论 REST 还是 GraphQL，最终都通过 `getService()` 工厂函数或直接实例化专门的 Service 子类，这些子类都继承自 `ItemsService`：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              入口层差异                                       │
+├─────────────────────────────────────┬───────────────────────────────────────┤
+│           REST API                  │              GraphQL                   │
+├─────────────────────────────────────┼───────────────────────────────────────┤
+│  controllers/users.ts               │  services/graphql/schema/index.ts     │
+│  ├── router.use(useCollection(     │  ├── scopeFilter 过滤集合            │
+│  │     'directus_users'))           │  ├── SYSTEM_DENY_LIST 黑名单         │
+│  ├── POST /users                    │  └── READ_ONLY 只读限制              │
+│  │    new UsersService()            │                                     │
+│  ├── POST /users/invite             │  services/graphql/resolvers/         │
+│  ├── POST /users/me/tfa             │  ├── query.ts                        │
+│  └── ...                            │  │   collection = 'users'            │
+│                                     │  │   if (scope === 'system')         │
+│                                     │  │       collection = 'directus_users'│
+│                                     │  └── mutation.ts                     │
+│                                     │      getService(collection)          │
+└─────────────────────────────────────┴───────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         统一服务层                                             │
+│                                                                               │
+│   getService('directus_users', opts)                                        │
+│       │                                                                       │
+│       ▼                                                                       │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  switch (collection) {                                              │   │
+│   │      case 'directus_users':                                         │   │
+│   │          return new UsersService(opts);  // ← 继承 ItemsService   │   │
+│   │      case 'directus_files':                                         │   │
+│   │          return new FilesService(opts);  // ← 继承 ItemsService   │   │
+│   │      case 'directus_activity':                                      │   │
+│   │          return new ActivityService(opts); // ← 继承 ItemsService  │   │
+│   │      // ...                                                         │   │
+│   │      default:                                                        │   │
+│   │          return new ItemsService(collection, opts);                │   │
+│   │  }                                                                  │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                        │
+│                                      ▼                                        │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                     UsersService (继承 ItemsService)                │   │
+│   │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│   │  │  覆盖的方法：                                                │   │   │
+│   │  │  - createOne()     // 添加邮箱唯一性检查、密码策略检查      │   │   │
+│   │  │  - createMany()    // 批量用户创建优化                      │   │   │
+│   │  │  - updateMany()    // 角色变更、状态变更特殊处理            │   │   │
+│   │  │  - deleteMany()    // 管理员剩余数量检查                      │   │   │
+│   │  │                                                  │   │   │
+│   │  │  新增的方法：                                                │   │   │
+│   │  │  - inviteUser()        // 邀请用户                          │   │   │
+│   │  │  - acceptInvite()      // 接受邀请                          │   │   │
+│   │  │  - registerUser()      // 用户注册                          │   │   │
+│   │  │  - requestPasswordReset() // 请求密码重置                   │   │   │
+│   │  │  - resetPassword()     // 重置密码                          │   │   │
+│   │  └─────────────────────────────────────────────────────────────┘   │   │
+│   │                              │                                        │   │
+│   │                              ▼                                        │   │
+│   │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│   │  │              ItemsService (父类，核心实现)                   │   │   │
+│   │  │  - readByQuery() / readOne() / readMany()                   │   │   │
+│   │  │  - createOne() / createMany()                                │   │   │
+│   │  │  - updateOne() / updateMany() / updateByQuery()             │   │   │
+│   │  │  - deleteOne() / deleteMany() / deleteByQuery()             │   │   │
+│   │  │  - ... 以及权限检查、Hooks、缓存清除等通用逻辑               │   │   │
+│   │  └─────────────────────────────────────────────────────────────┘   │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**REST 与 GraphQL 系统集合入口对比**：
+
+| 维度 | REST API | GraphQL |
+|------|---------|---------|
+| **路由设计** | 每个系统集合独立控制器文件 | 通过 scope 动态生成 Schema |
+| **集合命名** | 直接使用完整名 `directus_users` | 查询时去掉前缀，解析时还原 |
+| **服务实例化** | 直接 `new UsersService()` | 通过 `getService()` 工厂 |
+| **额外端点** | 支持 `/users/invite` 等自定义端点 | 无自定义端点，只能通过查询/变更 |
+| **只读限制** | 控制器层面不暴露 POST/PATCH/DELETE | Schema 生成时不生成 Mutation |
+| **黑名单** | 无（各控制器独立控制） | `SYSTEM_DENY_LIST` 完全排除 |
+| **访问入口** | `/users`、`/files` 等独立路径 | `/graphql/system` 统一入口 |
+
+---
+
 ## 三、ItemsService 核心实现分析
 
 ### 3.1 类结构与依赖
