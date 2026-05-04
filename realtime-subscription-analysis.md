@@ -1112,6 +1112,538 @@ switch (event?.action) {
 4. **多实例友好**：通过消息总线实现跨实例事件分发
 5. **细粒度控制**：支持 collection 级别、item 级别、event 类型级别的过滤
 
+---
+
+## 附录 C：错误回包 uid、订阅预校验与订阅保留机制
+
+### 问题 1：权限失败错误回包是否携带 uid？
+
+**答案：取决于错误发生的阶段和错误类型。**
+
+#### 1.1 订阅建立阶段的错误
+
+**情况 A：手动创建的 `WebSocketError`（如 `INVALID_COLLECTION`）**
+
+**代码位置**：`api/src/websocket/handlers/subscribe.ts:147-154`
+
+```typescript
+if (!accountability?.admin && !schema.collections[collection]) {
+    throw new WebSocketError(
+        'subscribe',
+        'INVALID_COLLECTION',
+        'The provided collection does not exists or is not accessible.',
+        message.uid,  // 关键：这里传入了 uid！
+    );
+}
+```
+
+**错误回包格式（带 uid）**：
+```json
+{
+    "type": "subscribe",
+    "status": "error",
+    "error": {
+        "code": "INVALID_COLLECTION",
+        "message": "The provided collection does not exists or is not accessible."
+    },
+    "uid": "my-subscription-1"
+}
+```
+
+**情况 B：从 `getPayload` 抛出的异常（如 `ForbiddenError`）**
+
+**代码位置**：`api/src/websocket/handlers/subscribe.ts:177-187`
+
+```typescript
+const data =
+    subscription.event === undefined 
+        ? await getPayload(subscription, accountability, schema)  // 可能抛出 ForbiddenError
+        : { event: 'init' };
+
+// ...
+
+} catch (err) {
+    handleWebSocketError(client, err, 'subscribe');  // 没有传递 uid！
+}
+```
+
+**`handleWebSocketError` 的处理逻辑**：`api/src/websocket/errors.ts:51-56`
+
+```typescript
+if (isDirectusError(error)) {
+    // ForbiddenError 是 DirectusError，走这个分支
+    client.send(WebSocketError.fromError(error, type).toMessage());
+    return;
+}
+```
+
+**`WebSocketError.fromError` 的实现**：`api/src/websocket/errors.ts:41-43`
+
+```typescript
+static fromError(error: DirectusError<unknown>, type = 'unknown') {
+    return new WebSocketError(type, error.code, error.message);
+    // 注意：没有传入 uid！
+}
+```
+
+**错误回包格式（不带 uid）**：
+```json
+{
+    "type": "subscribe",
+    "status": "error",
+    "error": {
+        "code": "FORBIDDEN",
+        "message": "You don't have permission to access this."
+    }
+    // 注意：没有 uid 字段！
+}
+```
+
+#### 1.2 事件分发阶段的错误
+
+**代码位置**：`api/src/websocket/handlers/subscribe.ts:125-133`
+
+```typescript
+try {
+    const result = await getPayload(subscription, client.accountability, schema, event);
+    // ...
+} catch (err) {
+    handleWebSocketError(client, err, 'subscribe');  // 没有传递 subscription.uid！
+}
+```
+
+**错误回包格式（不带 uid）**：
+```json
+{
+    "type": "subscribe",
+    "status": "error",
+    "error": {
+        "code": "FORBIDDEN",
+        "message": "You don't have permission to access this."
+    }
+    // 注意：没有 uid 字段！
+}
+```
+
+#### 1.3 uid 携带情况总结
+
+| 错误阶段 | 错误类型 | 是否携带 uid | 代码位置 |
+|---------|---------|-------------|---------|
+| 订阅建立阶段 | 手动创建的 `WebSocketError`（如 `INVALID_COLLECTION`） | ✅ **是** | `subscribe.ts:147-154` |
+| 订阅建立阶段 | 从 `getPayload` 抛出的 `ForbiddenError` 等 | ❌ **否** | `subscribe.ts:185-187` |
+| 事件分发阶段 | 任何错误 | ❌ **否** | `subscribe.ts:131-133` |
+
+**关键原因**：
+- `WebSocketError.fromError()` 方法不接受 `uid` 参数
+- `handleWebSocketError()` 在事件分发阶段没有访问 `subscription.uid`
+
+---
+
+### 问题 2：订阅建立阶段有无预校验？
+
+**答案：有部分预校验，但取决于订阅参数。**
+
+#### 2.1 订阅建立阶段的完整流程
+
+**代码位置**：`api/src/websocket/handlers/subscribe.ts:140-199`
+
+```typescript
+async onMessage(client: WebSocketClient, message: WebSocketSubscribeMessage) {
+    if (getMessageType(message) === 'subscribe') {
+        try {
+            const collection = String(message.collection!);
+            const accountability = client.accountability;
+            const schema = await getSchema();
+
+            // ============================================
+            // 预校验 1：Collection 存在性检查
+            // ============================================
+            if (!accountability?.admin && !schema.collections[collection]) {
+                throw new WebSocketError(
+                    'subscribe',
+                    'INVALID_COLLECTION',
+                    'The provided collection does not exists or is not accessible.',
+                    message.uid,
+                );
+            }
+
+            const subscription: Subscription = {
+                client,
+                collection,
+            };
+
+            if ('event' in message) {
+                subscription.event = message.event as SubscriptionEvent;
+            }
+
+            // ============================================
+            // 预校验 2：Query 参数清理（如有 query）
+            // ============================================
+            if (message.query) {
+                subscription.query = await sanitizeQuery(message.query, schema, accountability);
+            }
+
+            if ('item' in message) subscription.item = String(message.item);
+
+            if ('uid' in message) {
+                subscription.uid = String(message.uid);
+                this.unsubscribe(client, subscription.uid);
+            }
+
+            // ============================================
+            // 预校验 3：权限预校验（条件执行）
+            // ============================================
+            const data =
+                subscription.event === undefined 
+                    ? await getPayload(subscription, accountability, schema)  // 关键：只有未指定 event 时才执行
+                    : { event: 'init' };  // 指定了 event，跳过权限预校验
+
+            // ============================================
+            // 只有以上都成功才注册订阅
+            // ============================================
+            this.subscribe(subscription);
+
+            // 发送初始响应
+            client.send(fmtMessage('subscription', data, subscription.uid));
+        } catch (err) {
+            handleWebSocketError(client, err, 'subscribe');
+        }
+    }
+}
+```
+
+#### 2.2 预校验项详细说明
+
+| 预校验项 | 触发条件 | 校验内容 | 失败行为 |
+|---------|---------|---------|---------|
+| **Collection 存在性** | 总是执行（非 admin 用户） | 检查 collection 是否在 schema 中 | 发送 `INVALID_COLLECTION` 错误（带 uid），订阅不注册 |
+| **Query 参数清理** | 提供了 `query` 参数 | 清理和验证查询参数（fields、filter、sort 等） | 发送错误消息，订阅不注册 |
+| **权限预校验** | **未指定 `event` 类型** | 通过 `getPayload` → `readByQuery` 检查读取权限 | 发送 `FORBIDDEN` 错误（不带 uid），订阅不注册 |
+
+#### 2.3 关键发现：event 参数决定是否进行权限预校验
+
+**场景 A：订阅时未指定 event 类型**
+
+```json
+// 订阅消息
+{
+    "type": "subscribe",
+    "collection": "articles",
+    "uid": "my-subscription-1"
+    // 注意：没有 event 字段
+}
+```
+
+**行为**：
+- 执行 `getPayload(subscription, accountability, schema)`
+- 调用 `readByQuery()` 进行实际的数据读取
+- `processAst` 会注入权限过滤条件
+- 如果没有读取权限或没有可见数据，抛出 `ForbiddenError`
+- **订阅不会被注册**
+
+**场景 B：订阅时指定了 event 类型**
+
+```json
+// 订阅消息
+{
+    "type": "subscribe",
+    "collection": "articles",
+    "event": "create",  // 关键：指定了 event 类型
+    "uid": "my-subscription-1"
+}
+```
+
+**行为**：
+- 跳过 `getPayload`，直接使用 `{ event: 'init' }`
+- **不进行任何权限预校验**
+- 直接注册订阅
+- 发送初始响应：
+  ```json
+  {
+      "type": "subscription",
+      "event": "init",
+      "uid": "my-subscription-1"
+  }
+  ```
+
+#### 2.4 订阅建立阶段预校验流程图
+
+```
+客户端发送 subscribe 消息
+         ↓
+┌─────────────────────────────────────┐
+│  预校验 1：Collection 存在性检查     │
+│  (非 admin 用户)                     │
+├─────────────────────────────────────┤
+│  失败？                               │
+│  ├── 是 → 发送 INVALID_COLLECTION    │
+│  │         错误消息 (带 uid)          │
+│  │         订阅不注册                 │
+│  │         流程结束                   │
+│  │                                    │
+│  └── 否 → 继续                       │
+└─────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────┐
+│  预校验 2：Query 参数清理            │
+│  (如有 query 参数)                   │
+├─────────────────────────────────────┤
+│  失败？                               │
+│  ├── 是 → 发送错误消息               │
+│  │         订阅不注册                 │
+│  │         流程结束                   │
+│  │                                    │
+│  └── 否 → 继续                       │
+└─────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────┐
+│  是否指定了 event 类型？             │
+├─────────────────────────────────────┤
+│  ├── 否 → 预校验 3：权限预校验        │
+│  │         getPayload() → readByQuery│
+│  │         ├── 失败 → 发送 FORBIDDEN │
+│  │         │         错误 (不带 uid)  │
+│  │         │         订阅不注册       │
+│  │         │         流程结束         │
+│  │         │                          │
+│  │         └── 成功 → 继续           │
+│  │                                    │
+│  └── 是 → 跳过权限预校验              │
+│           直接使用 { event: 'init' } │
+└─────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────┐
+│  注册订阅                            │
+│  发送初始响应                        │
+│  流程结束                            │
+└─────────────────────────────────────┘
+```
+
+---
+
+### 问题 3：出错后订阅是否保留并如何影响后续事件？
+
+**答案：取决于错误发生的阶段。**
+
+#### 3.1 订阅建立阶段出错
+
+**代码位置**：`api/src/websocket/handlers/subscribe.ts:141-187`
+
+```typescript
+async onMessage(client: WebSocketClient, message: WebSocketSubscribeMessage) {
+    if (getMessageType(message) === 'subscribe') {
+        try {
+            // ... 各种预校验 ...
+            
+            const data = subscription.event === undefined 
+                ? await getPayload(subscription, accountability, schema) 
+                : { event: 'init' };
+
+            // ============================================
+            // 关键：只有前面没有错误才执行这行
+            // ============================================
+            this.subscribe(subscription);  // 注册订阅
+
+            client.send(fmtMessage('subscription', data, subscription.uid));
+        } catch (err) {
+            // ============================================
+            // 出错后只发送错误消息，不注册订阅
+            // ============================================
+            handleWebSocketError(client, err, 'subscribe');
+        }
+    }
+}
+```
+
+**订阅建立阶段出错的行为**：
+- **订阅不会被注册**（`this.subscribe` 在 try 块末尾）
+- 只发送错误消息
+- 后续事件不会触发该订阅（因为订阅不存在）
+
+#### 3.2 事件分发阶段出错
+
+**代码位置**：`api/src/websocket/handlers/subscribe.ts:108-135`
+
+```typescript
+async dispatch(event: WebSocketEvent) {
+    const subscriptions = this.subscriptions[event.collection];
+    if (!subscriptions || subscriptions.size === 0) return;
+    const schema = await getSchema();
+
+    for (const subscription of subscriptions) {
+        const { client } = subscription;
+
+        // 事件类型过滤
+        if (subscription.event !== undefined && event.action !== subscription.event) {
+            continue;
+        }
+
+        // item 过滤
+        if ('item' in subscription) {
+            if ('keys' in event && !event.keys.includes(subscription.item)) continue;
+            if ('key' in event && event.key !== subscription.item) continue;
+        }
+
+        try {
+            const result = await getPayload(subscription, client.accountability, schema, event);
+
+            // 路径 A：空数组静默跳过
+            if (Array.isArray(result?.['data']) && result?.['data']?.length === 0) continue;
+
+            // 成功：发送消息
+            client.send(fmtMessage('subscription', result, subscription.uid));
+        } catch (err) {
+            // ============================================
+            // 路径 B：只发送错误消息，不取消订阅
+            // ============================================
+            handleWebSocketError(client, err, 'subscribe');
+            // 注意：没有调用 this.unsubscribe()！
+        }
+    }
+}
+```
+
+**事件分发阶段出错的行为**：
+- **订阅会保留**（没有调用 `unsubscribe`）
+- 发送错误消息给客户端
+- 后续事件**仍然会触发**该订阅
+
+#### 3.3 后续事件的影响
+
+**场景：订阅者暂时没有权限，后来获得了权限**
+
+```
+时间线：
+
+T0: 订阅者订阅 articles 并指定 event: 'create'
+     → 跳过权限预校验
+     → 订阅注册成功
+
+T1: User A 创建文章 { id: 1, status: 'draft' }
+     → 事件到达 dispatch()
+     → 订阅者没有读取 draft 文章的权限
+     → getPayload() 抛出 ForbiddenError
+     → 发送错误消息（不带 uid）
+     → 订阅保留
+
+T2: 订阅者的权限被更新，现在可以读取 draft 文章
+
+T3: User A 创建文章 { id: 2, status: 'draft' }
+     → 事件到达 dispatch()
+     → getPayload() 成功读取
+     → 发送订阅消息
+     → 订阅继续保留
+```
+
+**场景：订阅者一直没有权限**
+
+```
+时间线：
+
+T0: 订阅者订阅 articles 并指定 event: 'create'
+     → 订阅注册成功
+
+T1: User A 创建文章 1
+     → 错误，订阅保留
+
+T2: User A 创建文章 2
+     → 错误，订阅保留
+
+T3: User A 创建文章 3
+     → 错误，订阅保留
+
+... 每次事件都会发送错误消息，但订阅一直保留
+```
+
+#### 3.4 订阅保留情况总结
+
+| 错误阶段 | 订阅是否保留 | 后续事件影响 | 代码位置 |
+|---------|-------------|-------------|---------|
+| 订阅建立阶段 | ❌ **不保留** | 不会触发（订阅不存在） | `subscribe.ts:180-187` |
+| 事件分发阶段 - 路径 A（空数组） | ✅ **保留** | 继续触发（静默跳过） | `subscribe.ts:128` |
+| 事件分发阶段 - 路径 B（抛出异常） | ✅ **保留** | 继续触发（每次都发送错误） | `subscribe.ts:131-133` |
+
+#### 3.5 完整的订阅生命周期流程图
+
+```
+┌─────────────────────────────────────┐
+│         订阅建立阶段                  │
+├─────────────────────────────────────┤
+│  客户端发送 subscribe 消息           │
+│         ↓                           │
+│  预校验 1-3                          │
+│         ↓                           │
+│  成功？                               │
+│  ├── 是 → 注册订阅                   │
+│  │         ↓                         │
+│  │      [订阅建立成功，进入事件分发阶段] │
+│  │                                    │
+│  └── 否 → 发送错误消息               │
+│           订阅不注册                 │
+│           流程结束                   │
+└─────────────────────────────────────┘
+
+┌─────────────────────────────────────┐
+│         事件分发阶段                  │
+│  (订阅建立成功后，每次事件到达时)    │
+├─────────────────────────────────────┤
+│  事件到达 dispatch()                 │
+│         ↓                           │
+│  遍历订阅                             │
+│         ↓                           │
+│  事件类型/Item 过滤？                 │
+│  ├── 否 → continue（跳过该订阅）     │
+│  │                                    │
+│  └── 是 → getPayload()               │
+│           ↓                         │
+│  成功？                               │
+│  ├── 是 → 数据为空？                  │
+│  │        ├── 是 → continue          │
+│  │        │         静默跳过          │
+│  │        │         订阅保留          │
+│  │        │                          │
+│  │        └── 否 → 发送订阅消息       │
+│  │              订阅保留              │
+│  │                                   │
+│  └── 否 → catch 块                   │
+│           发送错误消息                │
+│           订阅保留                    │
+└─────────────────────────────────────┘
+```
+
+---
+
+### 附录 C 总结
+
+#### 1. 错误回包 uid 总结
+
+| 场景 | 是否携带 uid |
+|-----|-------------|
+| 订阅建立阶段 - `INVALID_COLLECTION` 等手动创建的错误 | ✅ 是 |
+| 订阅建立阶段 - `getPayload` 抛出的 `ForbiddenError` | ❌ 否 |
+| 事件分发阶段 - 任何错误 | ❌ 否 |
+
+#### 2. 订阅预校验总结
+
+| 订阅方式 | 是否进行权限预校验 |
+|---------|-------------------|
+| 未指定 `event` 类型 | ✅ 是（通过 `getPayload`） |
+| 指定了 `event` 类型 | ❌ 否 |
+
+**注意**：Collection 存在性检查和 Query 清理总是执行。
+
+#### 3. 订阅保留总结
+
+| 错误阶段 | 订阅是否保留 |
+|---------|-------------|
+| 订阅建立阶段 | ❌ 不保留 |
+| 事件分发阶段（路径 A：空数组） | ✅ 保留 |
+| 事件分发阶段（路径 B：抛出异常） | ✅ 保留 |
+
+**关键影响**：事件分发阶段出错后，订阅仍然存在，后续事件会继续尝试分发。
+
+---
+
 ### 潜在的设计权衡
 
 1. **readOne vs readMany 行为不一致**：
@@ -1126,3 +1658,11 @@ switch (event?.action) {
 3. **静默跳过 vs 错误消息**：
    - 路径 A 的静默跳过可能让客户端困惑（为什么收不到通知？）
    - 路径 B 的错误消息可能暴露敏感信息（虽然 `ForbiddenError` 消息比较通用）
+
+4. **错误回包 uid 不一致**：
+   - 部分错误带 uid，部分不带
+   - 客户端难以关联错误和具体的订阅
+
+5. **事件分发阶段出错后订阅一直保留**：
+   - 可能导致客户端持续收到错误消息
+   - 没有自动退订机制
