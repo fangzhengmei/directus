@@ -444,90 +444,69 @@ export function getSharpInstance(): Sharp {
 
 ## 3. 资产访问权限控制
 
-### 3.1 权限检查入口
+### 3.1 权限检查的核心逻辑
 
-**关键代码位置：** `assets.ts:227-251`
+**关键代码位置：** `assets.ts:227-257`
 
 ```typescript
-// 1. UUID 格式验证（在权限检查之前）
+// 前置检查：UUID 格式验证
 if (!isValidUuid(id)) throw new ForbiddenError();
 
 let allowedFields: string[] = ['*'];
 
-// 2. 核心权限检查逻辑
+// 核心权限判断条件（短路与）
 if (!systemPublicKeys.includes(id) && this.accountability && this.accountability.admin !== true) {
-    const { allowedRootFields, accessAllowed } = await validateItemAccess(
-        {
-            accountability: this.accountability,
-            action: 'read',
-            collection: 'directus_files',
-            primaryKeys: [id],
-            returnAllowedRootFields: true,
-        },
-        { knex: this.knex, schema: this.schema },
-    );
+    // 只有满足以下三个条件才会进入权限系统校验：
+    // 1. 不是公共文件
+    // 2. 已登录（accountability 存在）
+    // 3. 不是管理员
+    
+    const { allowedRootFields, accessAllowed } = await validateItemAccess(...);
     
     if (!accessAllowed) {
-        throw new ForbiddenError({
-            reason: `You don't have permission to perform "read" for collection "directus_files" or it does not exist.`,
-        });
+        throw new ForbiddenError({...});
     }
     
     allowedFields = allowedRootFields;
 }
+
+// 所有请求都必须通过：文件物理存在性验证
+const file = (await this.sudoFilesService.readOne(id, { limit: 1 })) as File;
+const exists = await storage.location(file.storage).exists(file.filename_disk);
+if (!exists) throw new ForbiddenError();
 ```
 
-### 3.2 资产可见性的五层权限边界
+### 3.2 资产可见性的三层主线
 
-Directus 对资产访问有**严格的五层检查**，任何一层不通过都会返回 403 Forbidden。
+Directus 资产可见性采用**三层主线 + 两层必过检查**的设计：
 
 ```
-请求资产
-    ↓
-[第0层] UUID 格式验证
-    │
-    ├── 格式无效 → ForbiddenError
-    └── 有效 → 继续
-              ↓
-        [第1层] 系统公共文件豁免？
-              │
-              ├── 是（项目 Logo 等）→ 跳过所有权限检查，直接访问
-              └── 否 → 继续
-                        ↓
-                  [第2层] 管理员豁免？
-                        │
-                        ├── 是（accountability.admin === true）→ 跳过权限检查
-                        └── 否 → 继续
-                                  ↓
-                            [第3层] 权限系统检查（validateItemAccess）
-                                  │
-                                  ├── 无权限 → ForbiddenError
-                                  └── 有权限 → 继续
-                                            ↓
-                                      [第4层] 文件物理存在性验证
-                                            │
-                                            ├── 不存在 → ForbiddenError
-                                            └── 存在 → 继续
-                                                      ↓
-                                                [第5层] 字段级权限过滤
-                                                      │
-                                                      └── 过滤后返回文件信息
+┌─────────────────────────────────────────────────────────────────┐
+│                      第一层：公共资源豁免                          │
+│  进入条件：文件 ID 在系统公共文件列表中                            │
+│  豁免后：跳过第二层（权限系统校验）                                │
+│  但仍需通过：UUID 格式验证、文件物理存在性                        │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓ 不是公共文件
+┌─────────────────────────────────────────────────────────────────┐
+│                      第二层：权限系统校验                          │
+│  进入条件：不是公共文件 AND 已登录 AND 不是管理员                  │
+│  失败结果：ForbiddenError                                         │
+│  校验内容：集合级 + 字段级 + 记录级权限                           │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓ 权限通过 或 豁免
+┌─────────────────────────────────────────────────────────────────┐
+│                 第三层：字段过滤与文件存在性                       │
+│  文件存在性：所有请求必须通过（包括公共文件和管理员）              │
+│  字段过滤：根据 allowedRootFields 过滤返回字段                    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-#### 第 0 层：UUID 格式验证
+---
 
-**关键代码位置：** `assets.ts:227`
+### 第一层：公共资源豁免
 
-```typescript
-if (!isValidUuid(id)) throw new ForbiddenError();
-```
-
-**边界说明**：
-- 在**任何其他检查之前**执行
-- 防止 SQL 注入和无效 ID 查询
-- 即使是管理员，ID 格式无效也会被拒绝
-
-#### 第 1 层：系统公共文件豁免
+#### 进入条件
 
 **关键代码位置：** `assets.ts:215-220`
 
@@ -542,108 +521,120 @@ const systemPublicKeys: string[] = Object.values(publicSettings || {});
 
 **豁免的文件类型**：
 
-| 设置项 | 用途 |
-|--------|------|
-| `project_logo` | 项目 Logo |
-| `public_background` | 公共背景 |
-| `public_foreground` | 公共前景 |
-| `public_favicon` | 网站图标 |
+| 设置项 | 用途 | 访问场景 |
+|--------|------|----------|
+| `project_logo` | 项目 Logo | 登录页面、公共页面 |
+| `public_background` | 公共背景 | 登录页面、公共页面 |
+| `public_foreground` | 公共前景 | 登录页面、公共页面 |
+| `public_favicon` | 网站图标 | 浏览器标签页 |
 
-**边界说明**：
-- 这些文件**无需任何权限**即可访问
-- 用于登录页面、公共页面等无需认证的场景
-- 豁免后跳过第 2、3 层检查，但仍需通过第 0、4 层
-
-#### 第 2 层：管理员豁免
-
-**关键代码位置：** `assets.ts:231`
+#### 豁免后的权限边界
 
 ```typescript
+// 条件判断：如果是公共文件，!systemPublicKeys.includes(id) 为 false
+// 短路与（&&）会直接跳过后续判断
 if (!systemPublicKeys.includes(id) && this.accountability && this.accountability.admin !== true) {
-    // 执行权限检查
+    // 公共文件不会进入这里
 }
 ```
 
 **边界说明**：
-- 条件：`this.accountability.admin === true`
-- 管理员跳过第 3 层的权限系统检查
-- 但仍需通过第 0、1、4 层检查
+- **进入条件**：`systemPublicKeys.includes(id)` 为 true
+- **豁免范围**：跳过第二层（权限系统校验）
+- **仍需通过**：
+  - UUID 格式验证（第 0 层）
+  - 文件物理存在性（第三层）
 
-#### 第 3 层：权限系统检查（核心）
+#### 失败结果
+
+公共文件没有"失败"的概念——只要满足豁免条件，就跳过权限检查。但如果后续检查失败（如文件不存在），仍会返回 403。
+
+---
+
+### 第二层：权限系统校验
+
+#### 进入条件
+
+从核心条件 `!systemPublicKeys.includes(id) && this.accountability && this.accountability.admin !== true` 拆解：
+
+| 条件 | 说明 | 进入校验的要求 |
+|------|------|----------------|
+| `!systemPublicKeys.includes(id)` | 不是公共文件 | 必须满足 |
+| `this.accountability` | 已登录（accountability 存在） | 必须满足 |
+| `this.accountability.admin !== true` | 不是管理员 | 必须满足 |
+
+**三种豁免进入第二层的情况**：
+
+| 用户类型 | accountability 状态 | 是否进入权限校验 |
+|----------|---------------------|------------------|
+| 公共文件 | 任意 | 否（第一层豁免） |
+| 未登录用户 | `null` / `undefined` | 否（**重要！跳过权限校验**） |
+| 管理员 | `admin === true` | 否（管理员豁免） |
+| 普通已登录用户 | `admin !== true` | **是** |
+
+#### 未登录用户的特殊处理
+
+**重要发现**：未登录用户（`accountability` 为 `null`）会**跳过权限系统校验**！
+
+```typescript
+// 当 this.accountability 为 null 时
+// this.accountability && ... 为 false（短路与）
+// 所以不会进入 validateItemAccess
+if (!systemPublicKeys.includes(id) && this.accountability && this.accountability.admin !== true) {
+    // 未登录用户不会进入这里
+}
+```
+
+**权限对比表**：
+
+| 用户类型 | 权限检查 | 实际访问能力 |
+|----------|----------|--------------|
+| 公共文件 | 跳过 | 可访问所有物理存在的公共文件 |
+| 未登录用户 | 跳过 | **可访问所有物理存在的文件**（只要 UUID 有效） |
+| 管理员 | 跳过 | 可访问所有物理存在的文件 |
+| 普通已登录用户 | 必须通过 | 只能访问权限范围内的文件 |
+
+#### 权限系统校验的三个维度
 
 **关键代码位置：** `validate-item-access.ts:44-172`
 
-这是最复杂的一层，使用 `validateItemAccess` 函数执行**多级权限检查**。
-
-##### 3.1 validateItemAccess 内部流程
-
 ```
-调用 validateItemAccess
-    ↓
-[1] 构建查询 AST
-    ↓
-[2] processAst：注入权限规则
-    │
-    ├── 集合级权限检查
-    └── 字段级权限检查
-    ↓
-[3] 注入主键过滤条件
-    ↓
-[4] fetchPermittedAstRootFields：实际查询数据库
-    ↓
-[5] 检查返回数量是否匹配
-    │
-    ├── 不匹配 → accessAllowed = false
-    └── 匹配 → 继续
-              ↓
-        [6] 计算 allowedRootFields
-              ↓
-        [7] 返回结果
+┌──────────────────────────────────────────────────────────────┐
+│                    validateItemAccess 内部流程                  │
+├──────────────────────────────────────────────────────────────┤
+│  [1] 构建查询 AST                                              │
+│       ↓                                                        │
+│  [2] processAst：注入权限规则                                  │
+│       ├── 集合级权限检查：是否有权访问 directus_files 集合     │
+│       └── 字段级权限检查：可以访问哪些字段                      │
+│       ↓                                                        │
+│  [3] 注入主键过滤条件：id IN [请求的 ID]                       │
+│       ↓                                                        │
+│  [4] fetchPermittedAstRootFields：实际查询数据库               │
+│       ↓                                                        │
+│  [5] 检查返回数量是否匹配                                      │
+│       ├── 不匹配 → accessAllowed = false → 失败               │
+│       └── 匹配 → 继续                                         │
+│       ↓                                                        │
+│  [6] 计算 allowedRootFields（字段交集）                       │
+│       ↓                                                        │
+│  [7] 返回结果                                                  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-##### 3.2 权限检查的三个维度
+##### 维度 1：集合级权限
 
-| 维度 | 说明 | 检查方式 |
-|------|------|----------|
-| **集合级** | 是否有权访问 `directus_files` 集合 | 检查是否有 `read` 权限的策略 |
-| **字段级** | 可以访问哪些字段 | `fetchAllowedFields` 获取允许字段 |
-| **记录级** | 可以访问哪些具体文件 | 构建带权限过滤的查询，验证返回数量 |
+检查用户是否有权访问 `directus_files` 集合。
 
-##### 3.3 记录级权限验证原理
+**失败结果**：无法构建有效的查询 AST → `accessAllowed = false`
 
-**关键代码位置：** `validate-item-access.ts:127-135`
+##### 维度 2：字段级权限
 
-```typescript
-const items = await fetchPermittedAstRootFields(ast, {
-    schema: context.schema,
-    accountability: options.accountability,
-    knex: context.knex,
-    action: options.action,
-});
-
-const expectedCount = isSingleton && !hasPrimaryKeys ? 1 : options.primaryKeys!.length;
-const hasAccess = items && items.length === expectedCount;
-```
-
-**原理说明**：
-1. 构建一个包含**所有权限过滤条件**的查询
-2. 注入 `id IN [请求的 ID]` 过滤条件
-3. 执行查询，检查返回的记录数
-4. **如果返回数量 == 期望数量** → 有权限
-5. **如果返回数量 < 期望数量** → 部分或全部记录无权限 → 拒绝访问
-
-**示例**：
-- 请求 ID：`[A, B, C]`
-- 期望数量：3
-- 实际返回：`[A, C]`（只有 2 条）
-- 结果：`accessAllowed = false`（因为 B 无权限）
-
-##### 3.4 字段级权限计算
+检查用户可以访问哪些字段。
 
 **关键代码位置：** `validate-item-access.ts:153-168`
 
 ```typescript
-// 如果 returnAllowedRootFields，返回交集 of allowed fields across all items
 if (options.returnAllowedRootFields) {
     // 如果没有记录级规则，直接返回 permissioned fields
     if (!hasItemRules) {
@@ -665,28 +656,84 @@ if (options.returnAllowedRootFields) {
 ```
 
 **边界说明**：
-- 如果没有记录级权限规则 → 所有用户看到相同的字段集
-- 如果有记录级权限规则 → 计算所有请求记录的**字段交集**
+- 无记录级规则：所有用户看到相同的字段集
+- 有记录级规则：计算所有请求记录的**字段交集**
 - 只有**所有记录都允许访问**的字段才会返回
 
-#### 第 4 层：文件物理存在性验证
+##### 维度 3：记录级权限（核心）
+
+**关键代码位置：** `validate-item-access.ts:127-135`
+
+```typescript
+const items = await fetchPermittedAstRootFields(ast, {...});
+
+const expectedCount = isSingleton && !hasPrimaryKeys ? 1 : options.primaryKeys!.length;
+const hasAccess = items && items.length === expectedCount;
+```
+
+**验证原理**：
+1. 构建包含**所有权限过滤条件**的查询
+2. 注入 `id IN [请求的 ID]` 过滤条件
+3. 执行查询，检查返回的记录数
+4. **返回数量 == 期望数量** → 有权限
+5. **返回数量 < 期望数量** → 部分或全部记录无权限
+
+**示例场景**：
+
+| 请求 ID | 期望数量 | 实际返回 | 结果 |
+|---------|----------|----------|------|
+| `[A]` | 1 | `[A]` | 有权限 |
+| `[A, B, C]` | 3 | `[A, C]` | 无权限（B 被过滤） |
+| `[X]`（X 不存在） | 1 | `[]` | 无权限 |
+
+#### 失败结果
+
+当 `accessAllowed = false` 时：
+
+```typescript
+if (!accessAllowed) {
+    throw new ForbiddenError({
+        reason: `You don't have permission to perform "read" for collection "directus_files" or it does not exist.`,
+    });
+}
+```
+
+**可能的失败原因**：
+1. 集合级：无 `directus_files` 集合的 read 权限
+2. 记录级：请求的文件 ID 不在权限范围内
+3. 字段级：无任何字段的访问权限（极端情况）
+
+---
+
+### 第三层：字段过滤与文件存在性
+
+这一层是**所有请求必须通过**的检查，没有豁免。
+
+#### 3.1 文件物理存在性验证
 
 **关键代码位置：** `assets.ts:253-257`
 
 ```typescript
+// 使用 sudoFilesService（无 accountability）读取数据库记录
 const file = (await this.sudoFilesService.readOne(id, { limit: 1 })) as File;
 
+// 检查物理文件是否存在
 const exists = await storage.location(file.storage).exists(file.filename_disk);
 
 if (!exists) throw new ForbiddenError();
 ```
 
+**进入条件**：所有请求（包括公共文件、未登录用户、管理员）
+
+**失败结果**：`ForbiddenError`
+
 **边界说明**：
 - 即使数据库记录存在、权限检查通过
 - 如果**物理文件不存在**，仍返回 403
 - 这是安全措施：防止通过数据库记录猜测文件存在性
+- 使用 `sudoFilesService` 读取记录：即使无权限也能知道文件是否存在（但返回 403 不会泄露原因）
 
-#### 第 5 层：字段级权限过滤
+#### 3.2 字段级权限过滤
 
 **关键代码位置：** `assets.ts:57-74`
 
@@ -696,6 +743,7 @@ private sanitizeFields(file: File, allowedFields: string[]): Partial<File> {
         return file;
     }
     
+    // 始终返回的字段（用于 HTTP 响应头）
     const bypassFields: (keyof File)[] = ['type', 'filesize'];
     const fieldsToKeep = new Set<string>([...allowedFields, ...bypassFields]);
     
@@ -711,12 +759,37 @@ private sanitizeFields(file: File, allowedFields: string[]): Partial<File> {
 }
 ```
 
+**进入条件**：所有请求
+
+**失败结果**：无失败，只会过滤字段
+
 **边界说明**：
-- `type` 和 `filesize` 字段**始终返回**（用于 HTTP 响应头）
+- `type` 和 `filesize` 字段**始终返回**（用于 HTTP 响应头：Content-Type、Content-Length）
 - 其他字段根据 `allowedRootFields` 过滤
 - 即使有权限访问文件，某些元数据字段可能被过滤
 
-### 3.3 条件请求的前置检查
+---
+
+### 3.3 前置检查：UUID 格式验证
+
+**关键代码位置：** `assets.ts:227`
+
+```typescript
+if (!isValidUuid(id)) throw new ForbiddenError();
+```
+
+**进入条件**：所有请求
+
+**失败结果**：`ForbiddenError`
+
+**边界说明**：
+- 在**任何其他检查之前**执行
+- 防止 SQL 注入和无效 ID 查询
+- 即使是管理员、公共文件，ID 格式无效也会被拒绝
+
+---
+
+### 3.4 条件请求的前置检查
 
 **关键代码位置：** `assets.ts:336-387`（控制器层面）
 
@@ -757,64 +830,133 @@ if (revalidate) {
 **边界说明**：
 - 条件请求（304 Not Modified）也需要**先通过权限检查**
 - 防止未授权用户通过 304 响应猜测文件修改时间
+- 注意：`if (req.accountability)` 意味着未登录用户仍会跳过这个检查
 
-### 3.4 权限检查的关键边界总结
+---
 
-| 检查层 | 代码位置 | 检查内容 | 豁免条件 |
-|--------|----------|----------|----------|
-| 0. UUID 格式 | `assets.ts:227` | ID 是否为有效 UUID | 无 |
-| 1. 系统公共文件 | `assets.ts:215-220` | ID 是否在公共文件列表中 | 公共文件 ID |
-| 2. 管理员 | `assets.ts:231` | `accountability.admin === true` | 管理员 |
-| 3. 权限系统 | `validate-item-access.ts` | 集合+字段+记录级权限 | 无（非豁免用户必须通过） |
-| 4. 物理存在 | `assets.ts:255-257` | 文件是否存在于存储 | 无 |
-| 5. 字段过滤 | `assets.ts:57-74` | 过滤返回字段 | `type`, `filesize` 始终返回 |
+### 3.5 未登录用户 vs 普通已登录用户：对照访问路径
 
-### 3.5 典型权限场景
+#### 对照总览
 
-#### 场景 1：公共文件访问
+| 检查项 | 未登录用户 | 普通已登录用户 |
+|--------|-----------|----------------|
+| UUID 格式验证 | 必须通过 | 必须通过 |
+| 公共文件豁免 | 若是公共文件则豁免 | 若是公共文件则豁免 |
+| 权限系统校验 | **跳过** | **必须通过** |
+| 文件物理存在性 | 必须通过 | 必须通过 |
+| 字段过滤 | 可访问所有字段（`allowedFields = ['*']`） | 根据权限过滤 |
+
+#### 未登录用户访问路径
+
 ```
-请求：GET /assets/{project_logo_id}
-检查：
-  0. UUID 有效 ✓
-  1. 在公共文件列表中 ✓ → 跳过 2、3 层
-  4. 物理存在 ✓
-结果：成功访问
-```
-
-#### 场景 2：管理员访问任意文件
-```
-请求：GET /assets/{any_file_id}
-检查：
-  0. UUID 有效 ✓
-  1. 非公共文件 → 继续
-  2. 是管理员 ✓ → 跳过第 3 层
-  4. 物理存在 ✓
-结果：成功访问
-```
-
-#### 场景 3：普通用户无权限
-```
-请求：GET /assets/{restricted_file_id}
-检查：
-  0. UUID 有效 ✓
-  1. 非公共文件 → 继续
-  2. 非管理员 → 继续
-  3. validateItemAccess → 返回 0 条记录
-     → accessAllowed = false
-结果：ForbiddenError
+未登录用户请求 GET /assets/{file_id}
+    ↓
+[0] UUID 格式验证？
+    ├── 无效 → ForbiddenError
+    └── 有效 → 继续
+              ↓
+[1] 是否为公共文件？
+    ├── 是 → 跳过权限检查 → 继续
+    └── 否 → 继续
+              ↓
+[2] accountability 存在？
+    ├── 否（null）→ 短路与 → 跳过权限系统校验 → allowedFields = ['*']
+    └── 是 → （不可能，未登录）
+              ↓
+[3] 文件物理存在？
+    ├── 否 → ForbiddenError
+    └── 是 → 继续
+              ↓
+[4] 字段过滤
+    └── allowedFields = ['*'] → 返回完整文件信息
+              ↓
+结果：成功访问（只要 UUID 有效且文件存在）
 ```
 
-#### 场景 4：数据库存在但文件已删除
+#### 普通已登录用户访问路径
+
 ```
-请求：GET /assets/{file_with_missing_physical_file}
-检查：
-  0. UUID 有效 ✓
-  1. 非公共文件 → 继续
-  2. 管理员/有权限 ✓
-  3. 权限检查通过 ✓
-  4. storage.exists() → false
-结果：ForbiddenError
+普通已登录用户请求 GET /assets/{file_id}
+    ↓
+[0] UUID 格式验证？
+    ├── 无效 → ForbiddenError
+    └── 有效 → 继续
+              ↓
+[1] 是否为公共文件？
+    ├── 是 → 跳过权限检查 → 继续
+    └── 否 → 继续
+              ↓
+[2] 是管理员？
+    ├── 是 → 跳过权限系统校验 → allowedFields = ['*']
+    └── 否 → 继续
+              ↓
+[3] 权限系统校验（validateItemAccess）
+    ├── 集合级权限？
+    │   └── 无 → ForbiddenError
+    ├── 记录级权限？
+    │   └── 无 → ForbiddenError
+    └── 有权限 → 继续，获取 allowedRootFields
+              ↓
+[4] 文件物理存在？
+    ├── 否 → ForbiddenError
+    └── 是 → 继续
+              ↓
+[5] 字段过滤
+    └── 根据 allowedRootFields 过滤（type、filesize 始终返回）
+              ↓
+结果：成功访问（需通过权限检查）
 ```
+
+#### 对照场景示例
+
+**场景 1：访问非公共文件 A（UUID 有效，文件存在）**
+
+| 用户类型 | 权限检查 | 结果 |
+|----------|----------|------|
+| 未登录用户 | 跳过 | 成功访问 |
+| 普通用户（无 A 的权限） | 校验失败 | ForbiddenError |
+| 普通用户（有 A 的权限） | 校验通过 | 成功访问 |
+| 管理员 | 跳过 | 成功访问 |
+
+**场景 2：访问公共文件 B（项目 Logo）**
+
+| 用户类型 | 权限检查 | 结果 |
+|----------|----------|------|
+| 未登录用户 | 公共文件豁免 | 成功访问 |
+| 普通用户 | 公共文件豁免 | 成功访问 |
+| 管理员 | 公共文件豁免 | 成功访问 |
+
+**场景 3：访问不存在的文件 C（UUID 有效，但物理文件已删除）**
+
+| 用户类型 | 检查结果 |
+|----------|----------|
+| 未登录用户 | 文件存在性检查失败 → ForbiddenError |
+| 普通用户（有 C 的权限） | 文件存在性检查失败 → ForbiddenError |
+| 管理员 | 文件存在性检查失败 → ForbiddenError |
+
+---
+
+### 3.6 权限检查边界总结表
+
+| 检查层 | 代码位置 | 进入条件 | 豁免条件 | 失败结果 |
+|--------|----------|----------|----------|----------|
+| **0. UUID 格式** | `assets.ts:227` | 所有请求 | 无 | `ForbiddenError` |
+| **1. 公共资源豁免** | `assets.ts:215-220` | 非公共文件 | 公共文件 ID | 无（豁免后跳过第二层） |
+| **2. 权限系统校验** | `validate-item-access.ts` | 非公共文件 AND 已登录 AND 非管理员 | 公共文件、未登录、管理员 | `ForbiddenError` |
+| **3a. 文件存在性** | `assets.ts:255-257` | 所有请求 | 无 | `ForbiddenError` |
+| **3b. 字段过滤** | `assets.ts:57-74` | 所有请求 | `type`、`filesize` 始终返回 | 无（仅过滤） |
+
+---
+
+### 3.7 关键安全边界总结
+
+1. **未登录用户的权限**：未登录用户可以访问所有物理存在的文件（只要 UUID 有效）。这是 Directus 的设计，但需要注意：
+   - 如果需要限制未登录用户访问，应通过其他机制（如 API 密钥、中间件）
+   - 公共文件的豁免是显式设计，但未登录用户的"豁免"是条件判断的副作用
+
+2. **文件存在性的安全意义**：即使数据库记录存在，物理文件不存在也返回 403，防止通过数据库记录猜测文件存在性。
+
+3. **条件请求的权限检查**：304 Not Modified 响应也需要先通过权限检查，防止未授权用户通过缓存验证猜测文件修改时间。
 
 ---
 
