@@ -53,35 +53,88 @@ export type CollectionMeta = {
 };
 ```
 
-### 2.2 FieldMeta 定义
+### 2.2 FieldMeta 定义与可空性分析
 
 **文件位置**: `packages/types/src/fields.ts:36-59`
 
+根据类型定义，以下是 `FieldMeta` 每个字段的可空性分析：
+
 ```typescript
 export type FieldMeta = {
-    id: number;                    // 字段 ID
-    collection: string;            // 所属集合
-    field: string;                 // 字段名称
-    group: string | null;          // 字段组
-    hidden: boolean;               // 是否隐藏
-    interface: string | null;      // 界面组件类型（如 'input', 'select'）
-    display: string | null;        // 显示组件类型
-    options: Record<string, any>;  // 界面配置选项
-    display_options: Record<string, any>; // 显示配置选项
-    readonly: boolean;             // 是否只读
-    required: boolean;             // 是否必填
-    sort: number | null;           // 排序序号
-    special: string[] | null;      // 特殊类型标记（如 'file', 'm2o', 'o2m'）
-    translations: Translations[];  // 多语言翻译
-    width: Width | null;           // 表单宽度
-    note: string | null;           // 字段说明
-    conditions: Condition[];       // 条件逻辑
-    validation: Filter | null;     // 验证规则
-    validation_message: string;    // 验证失败消息
-    searchable: boolean;           // 是否可搜索
-    system?: true;                 // 是否系统字段
+    // ===== 非空字段 (No null) =====
+    id: number;                         // 字段 ID (非空)
+    collection: string;                 // 所属集合 (非空)
+    field: string;                      // 字段名称 (非空)
+    hidden: boolean;                    // 是否隐藏 (非空)
+    readonly: boolean;                  // 是否只读 (非空)
+    required: boolean;                  // 是否必填 (非空)
+    searchable: boolean;                // 是否可搜索 (非空)
+
+    // ===== 可空字段 (Allow null) =====
+    group: string | null;               // 字段组
+    interface: string | null;           // 界面组件类型（如 'input', 'select'）
+    display: string | null;             // 显示组件类型
+    options: Record<string, any> | null; // 界面配置选项
+    display_options: Record<string, any> | null; // 显示配置选项
+    sort: number | null;                // 排序序号
+    special: string[] | null;           // 特殊类型标记（如 'file', 'm2o', 'o2m'）
+    translations: Translations[] | null; // 多语言翻译
+    width: Width | null;                // 表单宽度
+    note: string | null;                // 字段说明
+    conditions: Condition[] | null;     // 条件逻辑
+    validation: Filter | null;          // 验证规则
+    validation_message: string | null;  // 验证失败消息
+
+    // ===== 可选字段 (Optional, 可能 undefined) =====
+    system?: true;                      // 是否系统字段
+    clear_hidden_value_on_save?: boolean; // 隐藏时是否清除值
 };
 ```
+
+#### FieldMeta 可空性总结表
+
+| 字段 | 类型 | 非空? | 来源/用途 |
+|------|------|-------|-----------|
+| `id` | `number` | ✅ 非空 | 数据库主键 |
+| `collection` | `string` | ✅ 非空 | 所属集合标识 |
+| `field` | `string` | ✅ 非空 | 字段名称 |
+| `hidden` | `boolean` | ✅ 非空 | 是否隐藏 |
+| `readonly` | `boolean` | ✅ 非空 | 是否只读 |
+| `required` | `boolean` | ✅ 非空 | UI 层面的必填标记 |
+| `searchable` | `boolean` | ✅ 非空 | 是否可搜索 |
+| `group` | `string \| null` | ❌ 可空 | 字段组引用 |
+| `interface` | `string \| null` | ❌ 可空 | 表单输入组件类型 |
+| `display` | `string \| null` | ❌ 可空 | 列表显示组件类型 |
+| `options` | `Record<string, any> \| null` | ❌ 可空 | Interface 配置选项 |
+| `display_options` | `Record<string, any> \| null` | ❌ 可空 | Display 配置选项 |
+| `sort` | `number \| null` | ❌ 可空 | 排序序号 |
+| `special` | `string[] \| null` | ❌ 可空 | 特殊类型标记（关系、文件、自动生成等）|
+| `translations` | `Translations[] \| null` | ❌ 可空 | 多语言翻译 |
+| `width` | `Width \| null` | ❌ 可空 | 表单宽度（half, full, fill）|
+| `note` | `string \| null` | ❌ 可空 | 字段帮助说明 |
+| `conditions` | `Condition[] \| null` | ❌ 可空 | 条件逻辑（条件隐藏、只读等）|
+| `validation` | `Filter \| null` | ❌ 可空 | 自定义验证规则 |
+| `validation_message` | `string \| null` | ❌ 可空 | 验证失败提示消息 |
+| `system` | `true \| undefined` | ❌ 可选 | 是否为系统字段 |
+| `clear_hidden_value_on_save` | `boolean \| undefined` | ❌ 可选 | 字段隐藏时是否清除值 |
+
+#### 关键发现：可空性与默认值的关系
+
+注意：`FieldMeta` 中的可空字段如果为 `null`，在不同场景下有不同的默认行为：
+
+1. **`interface: string | null`**
+   - 为 `null` 时：使用 `getDefaultInterfaceForType(field.type)` 选择默认 Interface
+   - 默认映射见 `app/src/utils/get-default-interface-for-type.ts`
+
+2. **`display: string | null`**
+   - 为 `null` 时：使用 `getDefaultDisplayForType(field.type)` 选择默认 Display
+
+3. **`options: Record<string, any> | null`**
+   - 为 `null` 时：传递空对象 `{}` 给 Interface 组件
+
+4. **`required: boolean`（非空但常被误解）**
+   - 注意：这个字段**只影响 UI 显示**（显示星号）
+   - **不影响 API 验证**！API 验证使用的是 `FieldOverview.nullable` + `FieldOverview.defaultValue`
 
 ### 2.3 SchemaOverview - 核心共享结构
 
