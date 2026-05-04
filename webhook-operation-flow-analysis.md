@@ -947,6 +947,39 @@ handler: async ({ flow, payload, iterationMode, batchSize }, context) => {
 
 ### 11.3 三种迭代模式详解
 
+#### ⚠️ 重要前置知识：子 Flow 的错误传播机制
+
+在深入了解迭代模式之前，必须理解一个关键机制：
+
+**子 Flow（trigger: 'operation'）的操作链 reject 状态不会自动抛出错误！**
+
+查看 `api/src/flows.ts:484-495` 的错误抛出逻辑：
+
+```typescript
+// 只有这些情况会抛出错误：
+if (
+    (flow.trigger === 'manual' || flow.trigger === 'webhook') &&
+    flow.options['async'] !== true &&
+    flow.options['error_on_reject'] === true &&
+    lastOperationStatus === 'reject'
+) {
+    throw keyedData[LAST_KEY];
+}
+
+if (flow.trigger === 'event' && flow.options['type'] === 'filter' && lastOperationStatus === 'reject') {
+    throw keyedData[LAST_KEY];
+}
+```
+
+**注意**：`trigger === 'operation'` 不在这些条件中！
+
+**结论**：
+- 子 Flow 操作链走到 reject 分支时，**不会自动抛出错误**
+- 只有当子 Flow 使用 `throw-error` operation 主动抛出错误时，才会导致父 Flow 的 `Promise.all` reject
+- 子 Flow 会正常返回 `flow.options['return']` 配置的值（或 `undefined`）
+
+---
+
 #### 模式一：Serial（串行）
 
 **适用场景**: 需要严格顺序执行、前一个结果影响后一个、或需要限制并发的场景。
@@ -981,8 +1014,11 @@ payload[2]                                        ├─────────
 
 **特点**:
 - 完全顺序执行
-- 任何一个失败会终止后续执行（除非有错误处理）
+- **只有子 Flow 主动 throw-error 时才会终止后续执行**
+- 子 Flow 操作链 reject 不会影响后续执行
 - 适用于依赖关系强的任务
+
+---
 
 #### 模式二：Batch（分批并行）
 
@@ -1036,7 +1072,10 @@ payload[4]                                        ├─────────
 - 批次内并行，批次间串行
 - 通过 `batchSize` 控制并发数
 - 平衡了性能和资源消耗
-- 任何一个批次内的失败会终止后续批次
+- **只有批次内有子 Flow 主动 throw-error 时，Promise.all 才会 reject，终止后续批次**
+- 子 Flow 操作链 reject 不会导致 Promise.all reject
+
+---
 
 #### 模式三：Parallel（并行，默认）
 
@@ -1073,9 +1112,285 @@ payload[3]  ├───────┤
 - 所有项同时启动
 - 最快的执行方式
 - 但可能消耗大量系统资源
-- 任何一个失败会导致整个 `Promise.all` 失败
+- **只有任一子 Flow 主动 throw-error 时，Promise.all 才会 reject**
+- 子 Flow 操作链 reject 不会导致 Promise.all reject
 
-### 11.4 三种模式对比
+---
+
+### 11.4 非法 iterationMode 的实际回退路径
+
+**代码结构分析**（`api/src/operations/trigger/index.ts:21-61`）:
+
+```typescript
+if (Array.isArray(payloadObject)) {
+    if (iterationMode === 'serial') {
+        // ... 执行，然后 return
+        return result;
+    }
+
+    if (iterationMode === 'batch') {
+        // ... 执行，然后 return
+        return result;
+    }
+
+    if (iterationMode === 'parallel' || !iterationMode) {
+        // ... 执行，然后 return
+        return result;
+    }
+    // ⚠️ 注意：这里没有 else！
+    // 如果 iterationMode 是非法值（如 'foo'），三个 if 都不匹配
+}
+
+// ⚠️ 这是最后的 return，在 if (Array.isArray) 块之外！
+return await flowManager.runOperationFlow(flow, payloadObject, omit(context, 'data'));
+```
+
+**实际行为分析**：
+
+| iterationMode 值 | payload 是数组时的行为 |
+|------------------|----------------------|
+| `'serial'` | 串行执行 ✅ |
+| `'batch'` | 分批并行执行 ✅ |
+| `'parallel'` | 完全并行执行 ✅ |
+| `null` / `undefined` / `''` / `0` / `false` | `!iterationMode` 为 true → 并行执行 ✅ |
+| `'foo'` / `'invalid'` / 其他 truthy 非法值 | ⚠️ **三个 if 都不匹配，整个数组作为单个 payload 传给子 Flow！** |
+
+**危险示例**：
+
+```typescript
+// 错误配置：iterationMode 拼写错误
+{
+    type: 'trigger',
+    options: {
+        flow: 'sub-flow-id',
+        payload: [1, 2, 3, 4, 5],
+        iterationMode: 'paralell'  // ⚠️ 拼写错误！
+    }
+}
+
+// 实际行为：
+// 子 Flow 只会被调用一次，payload 是整个数组 [1, 2, 3, 4, 5]
+// 而不是期望的 5 次，每次一个元素
+```
+
+---
+
+### 11.5 Operation Trigger 的 Return 默认值
+
+**对比各 Trigger 类型的默认配置**（`api/src/flows.ts:243-362`）:
+
+| Trigger 类型 | 默认 return 值 | 代码位置 |
+|-------------|----------------|----------|
+| `'webhook'` | `'$last'` | 第 266 行：`flow.options['return'] = flow.options['return'] ?? '$last'` |
+| `'manual'` | `'$last'` | 第 359 行：`flow.options['return'] = '$last'` |
+| `'operation'` | **无默认值！** | 第 243-246 行：没有设置 return |
+
+**代码对比**：
+
+```typescript
+// operation trigger - 没有设置默认 return！
+} else if (flow.trigger === 'operation') {
+    const handler = (data: unknown, context: Record<string, unknown>) => 
+        this.executeFlow(flow, data, context);
+    this.operationFlowHandlers[flow.id] = handler;
+}
+
+// webhook trigger - 有默认 return: '$last'
+} else if (flow.trigger === 'webhook') {
+    // ...
+    flow.options['return'] = flow.options['return'] ?? '$last';
+    // ...
+}
+```
+
+**对父 Flow `$last` 的影响**：
+
+查看 `executeFlow` 的返回逻辑（`api/src/flows.ts:497-503`）:
+
+```typescript
+if (flow.options['return'] === '$all') {
+    return keyedData;
+} else if (flow.options['return']) {
+    return get(keyedData, flow.options['return']);
+}
+
+return undefined;  // ⚠️ 如果没有配置 return，返回 undefined
+```
+
+**数据流**：
+
+```
+父 Flow                                                        子 Flow
+────────                                                        ───────
+    │
+    ▼
+Trigger Operation
+  - flow: 'sub-flow-id'
+  - payload: { ... }
+    │
+    ▼
+runOperationFlow() ─────────────────────────────────────────────►
+    │                                                             │
+    │                                                      执行操作链
+    │                                                      lastOperationStatus 可能是 resolve 或 reject
+    │                                                             │
+    │                                                      检查 return 配置：
+    │                                                      - 如果有 return 配置 → 返回对应值
+    │                                                      - 如果没有 return 配置 → 返回 undefined ⚠️
+    │                                                             │
+    ◄──────────────────────────────────────────── 返回值（可能是 undefined）
+    │
+    ▼
+父 Flow keyedData 更新：
+  - keyedData['<trigger_op_key>'] = 返回值（可能是 undefined）
+  - keyedData['$last'] = 返回值（可能是 undefined）⚠️
+    │
+    ▼
+后续操作使用 {{ $last }} 可能得到 undefined！
+```
+
+**实际影响示例**：
+
+```typescript
+// 子 Flow 配置（trigger: 'operation'）
+{
+    trigger: 'operation',
+    options: {
+        // ⚠️ 没有配置 return！
+    },
+    operation: {
+        key: 'do_something',
+        type: 'item-update',
+        options: { ... },
+        resolve: null,
+        reject: null
+    }
+}
+
+// 父 Flow 配置
+{
+    trigger: 'webhook',
+    operation: {
+        key: 'trigger_sub',
+        type: 'trigger',
+        options: {
+            flow: 'sub-flow-id',
+            payload: { ... }
+        },
+        resolve: {
+            key: 'use_result',
+            type: 'request',
+            options: {
+                url: 'https://api.example.com',
+                method: 'POST',
+                body: {
+                    result: '{{ $last }}'  // ⚠️ 这里会得到 undefined！
+                }
+            },
+            resolve: null,
+            reject: null
+        },
+        reject: null
+    }
+}
+```
+
+**解决方案**：
+
+子 Flow 必须显式配置 `return` 选项：
+
+```typescript
+// 子 Flow 正确配置
+{
+    trigger: 'operation',
+    options: {
+        return: '$last'  // ✅ 显式配置返回最后一个操作的结果
+        // 或 return: '$all'  // 返回所有数据
+        // 或 return: 'some_op_key'  // 返回指定操作的结果
+    },
+    operation: { ... }
+}
+```
+
+---
+
+### 11.6 子 Flow Reject 时的返回值
+
+**关键点**：子 Flow 操作链走到 reject 分支时，不会自动抛出错误，但会影响返回值吗？
+
+**答案**：不会影响返回值逻辑。
+
+查看 `executeFlow` 的完整流程（`api/src/flows.ts:393-504`）:
+
+```
+执行流程：
+1. 初始化 keyedData
+2. while (nextOperation !== null) {
+       执行操作
+       根据操作结果状态（resolve/reject）选择下一个操作
+       记录 lastOperationStatus
+   }
+3. 检查是否需要抛出错误（仅特定 trigger 类型）
+4. 根据 flow.options['return'] 返回值
+```
+
+**关键发现**：
+- `lastOperationStatus` 只影响**是否抛出错误**（特定 trigger 类型）
+- 不影响**返回值逻辑**
+- 返回值完全由 `flow.options['return']` 决定
+
+**示例**：
+
+```typescript
+// 子 Flow 配置
+{
+    trigger: 'operation',
+    options: {
+        return: '$last'  // ✅ 配置了 return
+    },
+    operation: {
+        key: 'validate',
+        type: 'condition',
+        options: {
+            filter: { '$trigger.value': { _gt: 0 } }
+        },
+        resolve: {
+            key: 'success',
+            type: 'transform',
+            options: {
+                transform: { result: 'ok', value: '{{ $trigger.value }}' }
+            },
+            resolve: null,
+            reject: null
+        },
+        reject: {
+            key: 'failure',
+            type: 'transform',
+            options: {
+                transform: { result: 'error', reason: 'value must be > 0' }
+            },
+            resolve: null,
+            reject: null
+        }
+    }
+}
+```
+
+**执行结果**：
+
+| 触发值 | 操作链路径 | lastOperationStatus | 返回值（$last） |
+|--------|-----------|---------------------|-----------------|
+| `{ value: 10 }` | validate → success | `'resolve'` | `{ result: 'ok', value: 10 }` |
+| `{ value: -5 }` | validate → failure | `'reject'` | `{ result: 'error', reason: 'value must be > 0' }` |
+
+**结论**：
+- 即使子 Flow 操作链走到 reject 分支，只要配置了 `return: '$last'`，父 Flow 就能拿到 reject 分支操作的结果
+- 父 Flow 可以通过检查返回值来判断子 Flow 的执行状态
+- **但如果没有配置 return，父 Flow 只能拿到 undefined**
+
+---
+
+### 11.7 三种模式对比（修正版）
 
 | 特性 | Serial | Batch | Parallel |
 |------|--------|-------|----------|
@@ -1084,7 +1399,8 @@ payload[3]  ├───────┤
 | **总耗时** | 最长（累加） | 中等 | 最短（取最大值） |
 | **资源消耗** | 最低 | 可控 | 最高 |
 | **适用场景** | 强依赖任务 | 大数据量 | 小数据量、无依赖 |
-| **失败处理** | 立即终止 | 批次内失败终止后续 | 任一失败则全部失败 |
+| **子 Flow throw-error 时** | 立即终止，抛出错误 | 批次内任一失败则 Promise.all reject，终止后续批次 | 任一失败则 Promise.all reject |
+| **子 Flow 操作链 reject 时** | 继续执行，返回子 Flow 的 return 值 | 继续执行，返回子 Flow 的 return 值 | 继续执行，返回子 Flow 的 return 值 |
 
 ### 11.5 Operation Trigger Flow 的注册与执行
 
