@@ -1187,6 +1187,696 @@ export class SequenceHelperDefault extends SequenceHelper {
 }
 ```
 
+#### 补充一：fn 函数辅助系统的深度分析
+
+`fn` helper 是 Directus 中处理字段函数的核心方言适配系统，它直接参与 SELECT 语句的字段生成。
+
+**fn helper 在查询管道中的调用位置**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           查询执行管道中的 fn helper                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ItemsService.readByQuery(query)                                            │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │  getAstFromQuery()  ──► 构建 AST                                       │ │
+│  │         │                                                               │ │
+│  │         ▼                                                               │ │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │ │
+│  │  │  FunctionFieldNode 处理                                           │   │ │
+│  │  │  {                                                                 │   │ │
+│  │  │    type: 'fn',                                                     │   │ │
+│  │  │    fn: 'year' | 'json' | 'count'...,                              │   │ │
+│  │  │    fieldKey: 'year_date_created',                                 │   │ │
+│  │  │    path: ['date_created']                                          │   │ │
+│  │  │  }                                                                 │   │ │
+│  │  └─────────────────────────────────────────────────────────────────┘   │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │  runAst(ast, schema, ...)                                             │ │
+│  │         │                                                               │ │
+│  │         ▼                                                               │ │
+│  │  parseCurrentLevel()  ──► 解析出 fieldNodes                           │ │
+│  │         │                                                               │ │
+│  │         ▼                                                               │ │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │ │
+│  │  │  getDBQuery()                                                    │   │ │
+│  │  │    ├── flatQuery.select(fieldNodes.map((node) => preProcess(node)))│ │ │
+│  │  │    │                                                              │   │ │
+│  │  │    ▼                                                              │   │ │
+│  │  │  ┌─────────────────────────────────────────────────────────────┐ │   │ │
+│  │  │  │  getColumnPreprocessor()                                   │ │   │ │
+│  │  │  │    └── getColumn(knex, table, column, alias, schema, ...)│ │   │ │
+│  │  │  │           │                                                 │ │   │ │
+│  │  │  │           ▼                                                 │ │   │ │
+│  │  │  │  ┌───────────────────────────────────────────────────────┐ │ │   │ │
+│  │  │  │  │  getFunctions(knex, schema)  →  FnHelper 实例       │ │ │   │ │
+│  │  │  │  │                                                   │ │   │ │
+│  │  │  │  │  // 核心：调用方言特定的函数实现                        │ │   │ │
+│  │  │  │  │  result = fn[functionName](table, fieldName, options) │ │   │ │
+│  │  │  │  │                                                   │ │   │ │
+│  │  │  │  │  // 例如：                                       │ │   │ │
+│  │  │  │  │  // PostgreSQL: fn.year() → EXTRACT(YEAR FROM ...)   │ │   │ │
+│  │  │  │  │  // MySQL:      fn.year() → YEAR(...)                 │ │   │ │
+│  │  │  │  │  // SQLite:     fn.year() → CAST(strftime(...) AS INT)│ │   │ │
+│  │  │  │  └───────────────────────────────────────────────────────┘ │ │   │ │
+│  │  │  └─────────────────────────────────────────────────────────────┘ │   │ │
+│  │  └─────────────────────────────────────────────────────────────────┘   │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**getColumn 函数的完整实现逻辑** (`run-ast/utils/get-column.ts`):
+
+```typescript
+export function getColumn(
+    knex: Knex,
+    table: string,
+    column: string,
+    alias: string | false = applyFunctionToColumnName(column),
+    schema: SchemaOverview,
+    options?: GetColumnOptions,
+): Knex.Raw {
+    // Step 1: 获取当前数据库的 fn helper 实例
+    const fn = getFunctions(knex, schema);
+
+    // Step 2: 检查是否是函数调用格式，如 "year(date_created)"
+    if (column.includes('(') && column.includes(')')) {
+        const functionName = column.split('(')[0] as FieldFunction;
+        const columnName = column.match(REGEX_BETWEEN_PARENS)![1];
+
+        // Step 3: 验证函数是否在 fn helper 中实现
+        if (functionName in fn) {
+            const collectionName = options?.originalCollectionName || table;
+            
+            // Step 4: 特殊处理 json 函数的路径解析
+            let fieldName = columnName!;
+            let jsonPath: string | undefined;
+            
+            if (functionName === 'json') {
+                const result = parseJsonFunction(column);
+                fieldName = result.field;
+                jsonPath = result.path;
+            }
+
+            // Step 5: 验证字段类型是否支持该函数
+            const type = schema?.collections[collectionName]?.fields?.[fieldName]?.type ?? 'unknown';
+            const allowedFunctions = getFunctionsForType(type);
+            
+            if (allowedFunctions.includes(functionName) === false) {
+                throw new InvalidQueryError({ 
+                    reason: `Invalid function specified "${functionName}"` 
+                });
+            }
+
+            // Step 6: 调用方言特定的函数实现
+            const result = fn[functionName as keyof typeof fn](table, fieldName, {
+                type,  // 字段类型，用于时区处理等
+                relationalCountOptions: isFunctionColumnOptions(options)
+                    ? {
+                        query: options.query,
+                        cases: options.cases,
+                        permissions: options.permissions,
+                    }
+                    : undefined,
+                originalCollectionName: options?.originalCollectionName,
+                jsonPath,  // 仅用于 json() 函数
+            }) as Knex.Raw;
+
+            // Step 7: 添加 AS 别名
+            if (alias) {
+                return knex.raw(result + ' AS ??', [alias]);
+            }
+
+            return result;
+        }
+        // ...
+    }
+    // ...
+}
+```
+
+**字段类型与允许的函数映射**：
+
+```typescript
+export function getFunctionsForType(type: string): string[] {
+    switch (type) {
+        case 'alias':
+            return ['count'];
+        case 'dateTime':
+        case 'timestamp':
+        case 'date':
+            return ['year', 'month', 'week', 'day', 'weekday', 'hour', 'minute', 'second'];
+        case 'json':
+            return ['count', 'json'];
+        default:
+            return [];
+    }
+}
+```
+
+**fn helper 不同数据库实现的关键差异**：
+
+| 数据库 | year() 实现 | 时区处理 | timestamp 格式 | JSON 路径语法 |
+|--------|------------|---------|---------------|--------------|
+| **PostgreSQL** | `EXTRACT(YEAR FROM ...)` | `AT TIME ZONE 'UTC'` (仅 timestamp 类型) | 驱动自动解析 | `->` 操作符链 |
+| **MySQL** | `YEAR(...)` | `CONVERT_TZ(..., @@session.time_zone, '+00:00')` | 手动 `JSON.parse` | `JSON_EXTRACT` + 路径字符串 |
+| **SQLite** | `CAST(strftime('%Y', ...) AS INTEGER)` | `strftime` 的 `'unixepoch'` 修饰符 | 手动 `JSON.parse` | `json_extract` + 路径字符串 |
+
+**PostgreSQL 时区处理的条件逻辑**：
+
+```typescript
+const parseLocaltime = (columnType?: string) => {
+    if (columnType === 'timestamp') {
+        return ` AT TIME ZONE 'UTC'`;
+    }
+    return '';
+};
+
+// 使用时：
+return this.knex.raw(
+    `EXTRACT(YEAR FROM ??.??${parseLocaltime(options?.type)})`,
+    [table, column]
+);
+```
+
+这意味着：
+- `timestamp` 类型字段：需要 `AT TIME ZONE 'UTC'` 转换
+- `dateTime` 类型字段：不需要额外转换
+
+**SQLite Unix 时间戳处理**：
+
+```typescript
+const parseLocaltime = (columnType?: string) => {
+    if (columnType === 'timestamp') {
+        return '';  // 已经是 Unix 时间
+    }
+    return `, 'localtime'`;
+};
+
+// year() 实现：
+return this.knex.raw(
+    `CAST(strftime('%Y', ??.?? / 1000, 'unixepoch'${parseLocaltime(options?.type)}) AS INTEGER)`,
+    [table, column]
+);
+```
+
+**关键注意点**：
+1. SQLite 中 `timestamp` 类型存储为 **Unix 毫秒**，需要 `/ 1000` 转换
+2. SQLite 中 `dateTime` 类型存储为 ISO 字符串，需要 `'localtime'` 修饰符
+
+**JSON 路径解析的差异**：
+
+```typescript
+// PostgreSQL: 构建操作符链
+// ".items[0].name" → "->'items'->0->'name'"
+const { template, bindings } = buildPostgresJsonPath(options.jsonPath);
+
+// MySQL: 转换为 JSONPath 语法
+// ".items[0].name" → "$.items[0].name"
+const jsonPath = convertToMySQLPath(options.jsonPath);
+
+// SQLite: 直接添加 $ 前缀
+// ".items[0].name" → "$.items[0].name"
+const jsonPath = '$' + options.jsonPath;
+```
+
+---
+
+#### 补充二：capabilities 能力检测系统的深度分析
+
+`capabilities` helper 不直接生成 SQL，而是通过**条件分支**影响查询构建策略。
+
+**两个 capabilities 方法的组合逻辑** (`get-db-query.ts`):
+
+```typescript
+// 在处理聚合查询和分组查询时
+if (queryCopy.aggregate || queryCopy.group) {
+    // ... 构建查询 ...
+
+    // 关键：两个条件的组合判断
+    if (
+        helpers.capabilities.supportsDeduplicationOfParameters() &&
+        !helpers.capabilities.supportsColumnPositionInGroupBy()
+    ) {
+        withPreprocessBindings(knex, dbQuery);
+    }
+}
+```
+
+**决策矩阵**：
+
+| 数据库 | supportsDeduplication | supportsColumnPositionInGroupBy | 是否调用 withPreprocessBindings |
+|--------|----------------------|---------------------------------|---------------------------------|
+| PostgreSQL | ❌ | ✅ | ❌ |
+| CockroachDB | ❌ | ✅ | ❌ |
+| MySQL | ✅ | ❌ | ✅ |
+| MSSQL | ✅ | ❌ | ✅ |
+| Oracle | ✅ | ❌ | ✅ |
+| SQLite | ✅ | ❌ | ✅ |
+
+**withPreprocessBindings 的实际作用**：
+
+```typescript
+export function withPreprocessBindings(knex: Knex, dbQuery: Knex.QueryBuilder) {
+    const schemaHelper = getHelpers(knex).schema;
+
+    // 使用 Proxy 拦截 Knex 客户端的方法
+    dbQuery.client = new Proxy(dbQuery.client, {
+        get(target, prop, receiver) {
+            // 拦截查询执行
+            if (prop === 'query') {
+                return (connection: Knex, queryParams: Knex.Sql) =>
+                    Reflect.get(target, prop, receiver).bind(dbQuery.client)(
+                        connection,
+                        schemaHelper.prepQueryParams(queryParams),  // 预处理查询参数
+                    );
+            }
+
+            // 拦截绑定处理
+            if (prop === 'prepBindings') {
+                return (bindings: Knex.Value[]) =>
+                    schemaHelper.prepBindings(
+                        Reflect.get(target, prop, receiver).bind(dbQuery.client)(bindings)
+                    );
+            }
+
+            return Reflect.get(target, prop, receiver);
+        },
+    });
+}
+```
+
+**prepQueryParams 的核心实现** (`schema/utils/prep-query-params.ts`):
+
+```typescript
+export function prepQueryParams(
+    queryParams: (Partial<Sql> & Pick<Sql, 'sql'>) | string,
+    options: PrepQueryParamsOptions,  // { format: (index) => string }
+) {
+    const query: Sql = { bindings: [], ...(isString(queryParams) ? { sql: queryParams } : queryParams) };
+
+    // 构建绑定值去重映射
+    // bindingIndices[value] = 首次出现的索引
+    const bindingIndices = new Map<Knex.Value, number>();
+    
+    // 去重后的绑定值数组
+    const bindings: Knex.Value[] = [];
+
+    let matchIndex = 0;
+    let nextBindingIndex = 0;
+
+    // 替换 SQL 中的 ? 占位符
+    const sql = query.sql.replace(/(\\*)(\?)/g, (_, escapes) => {
+        if (escapes.length % 2) {
+            // 转义的问号，保持不变
+            return `${'\\'.repeat(escapes.length)}?`;
+        }
+
+        const binding = query.bindings[matchIndex]!;
+        let bindingIndex: number;
+
+        if (bindingIndices.has(binding)) {
+            // 已存在的值，使用之前的索引
+            bindingIndex = bindingIndices.get(binding)!;
+        } else {
+            // 新值，分配新索引
+            bindingIndex = nextBindingIndex++;
+            bindingIndices.set(binding, bindingIndex);
+            bindings.push(binding);
+        }
+
+        matchIndex++;
+        // 使用数据库特定的格式（@p1, :1, 等）
+        return options.format(bindingIndex);
+    });
+
+    return { ...query, sql, bindings };
+}
+```
+
+**不同数据库的占位符转换**：
+
+| 数据库 | prepQueryParams 实现 | 占位符转换 |
+|--------|---------------------|-----------|
+| **MSSQL** | `prepQueryParams(queryParams, { format: (index) => `@p${index}` })` | `?` → `@p0`, `@p1`, `@p2`... |
+| **Oracle** | `prepQueryParams(queryParams, { format: (index) => `:${index + 1}` })` | `?` → `:1`, `:2`, `:3`... |
+| **MySQL** | 默认不转换 | 保持 `?` |
+| **PostgreSQL** | 默认不转换 | 保持 `$1`, `$2`... |
+
+**Oracle 的特殊处理**：
+
+```typescript
+override prepBindings(bindings: Knex.Value[]): any {
+    // 将数组转换为对象 { 1: value1, 2: value2, ... }
+    // 使用 "命名" 绑定语法而非位置绑定
+    return Object.fromEntries(
+        bindings.map((binding: any, index: number) => [index + 1, binding])
+    );
+}
+```
+
+**为什么 PostgreSQL 不支持参数去重**：
+
+```typescript
+// PostgreSQL 从参数首次引用的上下文推断类型
+// 这可能导致问题：
+
+// 假设查询：
+// SELECT * FROM table 
+// WHERE uuid_column = $1 AND string_column = $1
+
+// PostgreSQL 会推断 $1 为 UUID 类型（从 uuid_column）
+// 但 string_column 比较需要字符串类型
+// 这会导致类型不匹配错误！
+
+// 解决方案：使用独立的参数引用
+// SELECT * FROM table 
+// WHERE uuid_column = $1 AND string_column = $2
+// bindings: [value, value]
+```
+
+---
+
+#### 补充三：supportsColumnPositionInGroupBy 对分组查询的影响
+
+这个能力检测在 `apply-query/index.ts` 中影响 GROUP BY 子句的构建：
+
+```typescript
+if (query.group) {
+    const helpers = getHelpers(knex);
+    const rawColumns = query.group.map((column) => 
+        getColumn(knex, collection, column, false, schema)
+    );
+    let columns;
+
+    if (options?.groupWhenCases) {
+        // 关键：能力检测决定构建策略
+        if (helpers.capabilities.supportsColumnPositionInGroupBy() && options.groupColumnPositions) {
+            // PostgreSQL / CockroachDB: 使用列位置
+            columns = query.group.map((column, index) =>
+                options.groupColumnPositions![index] !== undefined 
+                    ? knex.raw(options.groupColumnPositions![index])  // e.g., 1, 2, 3
+                    : column,
+            );
+        } else {
+            // MySQL / MSSQL / Oracle / SQLite: 重建完整列表达式
+            columns = rawColumns.map((column, index) =>
+                applyCaseWhen(
+                    {
+                        columnCases: options.groupWhenCases![index]!.map(
+                            (caseIndex) => cases[caseIndex]!
+                        ),
+                        column,
+                        aliasMap,
+                        cases,
+                        table: collection,
+                        permissions,
+                    },
+                    { knex, schema },
+                ),
+            );
+        }
+        // ...
+    } else {
+        columns = rawColumns;
+    }
+
+    dbQuery.groupBy(columns);
+}
+```
+
+**groupColumnPositions 的计算** (`get-db-query.ts`):
+
+```typescript
+// Map the group field to their respective select column positions (1 based, offset by the number of aggregate terms)
+// 分组字段位置 = 索引 + 1 + 聚合字段数量
+// 因为聚合字段在 SELECT 中排在前面
+const groupColumnPositions = queryCopy.group?.map(
+    (field) => fieldNodeMap[field]![1] + 1 + aggregateCount
+) ?? [];
+```
+
+**两种策略的 SQL 差异**：
+
+假设查询：
+```
+fields: ['status', 'count(id) as total']
+group: ['status']
+```
+
+**PostgreSQL / CockroachDB 策略**：
+```sql
+-- 使用列位置
+SELECT status, COUNT(id) AS total
+FROM articles
+GROUP BY 1  -- 1 表示第一个 SELECT 列
+ORDER BY 1
+```
+
+**MySQL / MSSQL / Oracle / SQLite 策略**：
+```sql
+-- 使用完整列表达式
+SELECT status, COUNT(id) AS total
+FROM articles
+GROUP BY status
+ORDER BY status
+```
+
+**当存在权限 case/when 时的差异**：
+
+假设用户有条件权限（根据某些条件才能读取字段）：
+
+**PostgreSQL 策略**：
+```sql
+-- 使用列位置，不需要重复 case/when 逻辑
+SELECT 
+    CASE WHEN <condition> THEN status ELSE NULL END AS status,
+    COUNT(id) AS total
+FROM articles
+GROUP BY 1  -- 简单、高效
+```
+
+**MySQL 策略**：
+```sql
+-- 需要完整的 case/when 表达式
+SELECT 
+    CASE WHEN <condition> THEN status ELSE NULL END AS status,
+    COUNT(id) AS total
+FROM articles
+GROUP BY 
+    CASE WHEN <condition> THEN status ELSE NULL END  -- 重复 case/when
+```
+
+---
+
+#### 补充四：addInnerSortFieldsToGroupBy 的数据库差异
+
+这是 `schema` helper 中的方法，用于处理**内部查询排序字段与 GROUP BY 的关系**：
+
+```typescript
+// 调用位置：get-db-query.ts
+helpers.schema.addInnerSortFieldsToGroupBy(
+    groupByFields,
+    innerQuerySortRecords,
+    (hasMultiRelationalSort || sortRecords?.some(({ column }) => column.includes('.'))) ?? false,
+);
+```
+
+**各数据库实现对比**：
+
+| 数据库 | hasRelationalSort=true | hasRelationalSort=false | 排序字段引用 |
+|--------|------------------------|-------------------------|-------------|
+| **PostgreSQL** | 添加别名 | 不添加 | `alias`（字符串） |
+| **MySQL** | 添加别名 | 不添加 | `alias`（字符串） |
+| **CockroachDB** | 添加别名 | 不添加 | `alias`（字符串） |
+| **MSSQL** | **始终添加** | **始终添加** | `column`（Knex.Raw） |
+| **Oracle** | **始终添加** | **始终添加** | `column`（Knex.Raw） |
+| **SQLite** | 不添加 | 不添加 | - |
+
+**PostgreSQL 实现**：
+```typescript
+override addInnerSortFieldsToGroupBy(
+    groupByFields: (string | Knex.Raw)[],
+    sortRecords: SortRecord[],
+    hasRelationalSort: boolean,
+) {
+    if (hasRelationalSort) {
+        // 只在有关系排序时添加
+        // 使用别名（因为 PostgreSQL 支持 GROUP BY 别名）
+        groupByFields.push(...sortRecords.map(({ alias }) => alias));
+    }
+}
+```
+
+**MSSQL 实现**：
+```typescript
+override addInnerSortFieldsToGroupBy(
+    groupByFields: (string | Knex.Raw)[],
+    sortRecords: SortRecord[],
+    _hasRelationalSort: boolean,
+) {
+    // MSSQL 要求所有未聚合的 SELECT 列都在 GROUP BY 中
+    // 且 MSSQL 不支持 GROUP BY 别名
+    if (sortRecords.length > 0) {
+        // 始终添加，使用原始列表达式
+        groupByFields.push(...sortRecords.map(({ column }) => column));
+    }
+}
+```
+
+**SQLite 实现**：
+```typescript
+override addInnerSortFieldsToGroupBy() {
+    // SQLite 不需要特殊处理
+}
+```
+
+---
+
+#### 补充五：数据库方言差异对最终 SQL 的影响汇总
+
+**相同查询在不同数据库上的 SQL 差异**：
+
+假设查询：
+```
+GET /items/articles?fields=year(date_created),json(metadata,color)&group=status
+```
+
+**PostgreSQL 生成的 SQL**：
+```sql
+SELECT
+    EXTRACT(YEAR FROM "articles"."date_created" AT TIME ZONE 'UTC') AS "year_date_created",
+    "articles"."metadata"::jsonb->'color' AS "json_metadata_color",
+    "articles"."status"
+FROM "articles"
+GROUP BY 1, 2, 3  -- 使用列位置
+```
+
+**MySQL 生成的 SQL**：
+```sql
+SELECT
+    YEAR(`articles`.`date_created`) AS `year_date_created`,
+    JSON_UNQUOTE(JSON_EXTRACT(`articles`.`metadata`, '$.color')) AS `json_metadata_color`,
+    `articles`.`status`
+FROM `articles`
+GROUP BY `articles`.`status`, `year_date_created`, `json_metadata_color`  -- 使用列名/别名
+-- MySQL 支持 GROUP BY 别名
+```
+
+**SQLite 生成的 SQL**：
+```sql
+SELECT
+    CAST(strftime('%Y', `articles`.`date_created` / 1000, 'unixepoch') AS INTEGER) AS `year_date_created`,
+    json_extract(`articles`.`metadata`, '$.color') AS `json_metadata_color`,
+    `articles`.`status`
+FROM `articles`
+GROUP BY `articles`.`status`, `year_date_created`, `json_metadata_color`
+```
+
+---
+
+#### 补充六：关键能力检测的完整决策流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   查询构建时的能力检测决策流程                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  进入 getDBQuery()                                                          │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │  是否有 aggregate 或 group？                                           │ │
+│  │         │                                                               │ │
+│  │    Yes ────────────── No                                               │ │
+│  │     │                  │                                               │ │
+│  │     ▼                  ▼                                               │ │
+│  │  ┌─────────────┐   普通查询路径                                        │ │
+│  │  │ 聚合/分组查询│                                                      │ │
+│  │  └──────┬──────┘                                                      │ │
+│  │         │                                                               │ │
+│  │         ▼                                                               │ │
+│  │  计算 groupColumnPositions                                              │ │
+│  │  (列位置 = 索引 + 1 + 聚合数量)                                        │ │
+│  │         │                                                               │ │
+│  │         ▼                                                               │ │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │ │
+│  │  │  supportsDeduplicationOfParameters()  &&                         │   │ │
+│  │  │  !supportsColumnPositionInGroupBy()                              │   │ │
+│  │  │         │                                                         │   │ │
+│  │  │    Yes ────────────── No                                          │   │ │
+│  │  │     │                  │                                          │   │ │
+│  │  │     ▼                  ▼                                          │   │ │
+│  │  │  调用                  不调用                                      │   │ │
+│  │  │  withPreprocessBindings                                           │   │ │
+│  │  │         │                                                         │   │ │
+│  │  │         ▼                                                         │   │ │
+│  │  │  占位符转换：                                                     │   │ │
+│  │  │  - MSSQL: ? → @p0, @p1...                                       │   │ │
+│  │  │  - Oracle: ? → :1, :2...  + 绑定值对象化                         │   │ │
+│  │  │  - 绑定值去重                                                     │   │ │
+│  │  └─────────────────────────────────────────────────────────────────┘   │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│         │                                                                    │
+│         ▼                                                                    │
+│  进入 applyQuery()                                                          │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │  是否有 query.group？                                                 │ │
+│  │         │                                                               │ │
+│  │    Yes ────────────── No                                               │ │
+│  │     │                  │                                               │ │
+│  │     ▼                  ▼                                               │ │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │ │
+│  │  │  supportsColumnPositionInGroupBy()                               │   │ │
+│  │  │         │                                                         │   │ │
+│  │  │    Yes ────────────── No                                          │   │ │
+│  │  │     │                  │                                          │   │ │
+│  │  │     ▼                  ▼                                          │   │ │
+│  │  │  GROUP BY 1, 2, 3     GROUP BY column_name                       │   │ │
+│  │  │  (列位置)              (完整列表达式)                              │   │ │
+│  │  │                                                               │   │ │
+│  │  │  如果有 groupWhenCases:   如果有 groupWhenCases:                 │   │ │
+│  │  │    使用位置，无需重复       重建完整的 case/when 表达式           │   │ │
+│  │  │    case/when              (可能很复杂)                           │   │ │
+│  │  └─────────────────────────────────────────────────────────────────┘   │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│         │                                                                    │
+│         ▼                                                                    │
+│  是否需要内部查询 + CASE/WHEN 权限处理？                                    │
+│         │                                                                    │
+│    Yes ────────────── No                                                    │
+│     │                  │                                                     │
+│     ▼                  ▼                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │  addInnerSortFieldsToGroupBy()                                        │ │
+│  │         │                                                               │ │
+│  │  ┌─────┴─────┬─────┴─────┬─────┴─────┐                               │ │
+│  │  │  MSSQL    │  Oracle   │ PostgreSQL│                               │ │
+│  │  │           │           │   MySQL   │                               │ │
+│  │  │           │           │CockroachDB│                               │ │
+│  │  ├───────────┼───────────┼───────────┤                               │ │
+│  │  │ 始终添加  │ 始终添加  │ 有关系排序 │                               │ │
+│  │  │ 排序字段  │ 排序字段  │ 时才添加  │                               │ │
+│  │  │           │           │           │                               │ │
+│  │  │ 使用完整  │ 使用完整  │ 使用别名  │                               │ │
+│  │  │ 列表达式  │ 列表达式  │           │                               │ │
+│  │  └───────────┴───────────┴───────────┘                               │ │
+│  │                                                                          │ │
+│  │  SQLite: 不添加排序字段到 GROUP BY                                      │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### 4.3 查询执行管道 (`run-ast/`)
 
 #### AST 到 SQL 的转换流程
@@ -1492,6 +2182,8 @@ query {
 | 连接管理 | `api/src/database/index.ts` | Knex 连接、客户端检测 |
 | Helpers 工厂 | `api/src/database/helpers/index.ts` | 方言辅助函数工厂 |
 | 日期函数 | `api/src/database/helpers/date/` | 各数据库日期处理 |
+| **fn 函数助手** | `api/src/database/helpers/fn/` | 字段函数（year, json, count 等）方言适配 |
+| **capabilities 能力检测** | `api/src/database/helpers/capabilities/` | 数据库高级功能支持检测 |
 | 几何函数 | `api/src/database/helpers/geometry/` | 空间数据处理 |
 | 模式操作 | `api/src/database/helpers/schema/` | 数据库模式操作 |
 | 序列管理 | `api/src/database/helpers/sequence/` | 自增序列管理 |
@@ -1501,6 +2193,7 @@ query {
 | AST 构建 | `api/src/database/get-ast-from-query/` | Query 转 AST |
 | AST 执行 | `api/src/database/run-ast/` | AST 转 SQL 并执行 |
 | SQL 构建 | `api/src/database/run-ast/lib/get-db-query.ts` | Knex 查询构建器 |
+| **列获取与函数处理** | `api/src/database/run-ast/utils/get-column.ts` | 调用 fn helper 生成字段 SQL |
 | 过滤器 | `api/src/database/run-ast/lib/apply-query/filter/` | 过滤条件应用 |
 | | | |
 | **权限处理** | | |
