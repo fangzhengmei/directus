@@ -9,54 +9,1082 @@ Directus 通过一套完整的 Schema Introspection 机制来读取不同数据�
 ### 1. 架构层次
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        API Layer                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐ │
-│  │ SchemaService│  │ getSnapshot()│  │ CollectionsService│ │
-│  └──────────────┘  └──────────────┘  └──────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  @directus/schema Package                     │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │              createInspector() 工厂函数                 │  │
-│  │  (根据 Knex 客户端类型选择对应的 Inspector 实现)        │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                              │                                │
-│                              ▼                                │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │              SchemaInspector 接口 (统一契约)            │  │
-│  │  - overview()       - tables()      - tableInfo()     │  │
-│  │  - columns()        - columnInfo()  - foreignKeys()   │  │
-│  │  - hasTable()       - hasColumn()   - primary()       │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                              │                                │
-│          ┌───────────────────┼───────────────────┐          │
-│          ▼                   ▼                   ▼          │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐ │
-│  │PostgresSchema│    │MySQLSchema   │    │SqliteSchema  │ │
-│  │Inspector     │    │Inspector     │    │Inspector     │ │
-│  ├──────────────┤    ├──────────────┤    ├──────────────┤ │
-│  │MSSQLSchema   │    │CockroachDBSch│    │OracleDBSchema│ │
-│  │Inspector     │    │emaInspector  │    │Inspector     │ │
-│  └──────────────┘    └──────────────┘    └──────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           请求入口层 (Request Entry)                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Express Middleware: schema.ts                                       │   │
+│  │  - 每个请求自动加载 schema 到 req.schema                              │   │
+│  │  - 调用 getSchema() 获取/缓存结构信息                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      缓存与并发控制层 (Cache & Concurrency)                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  getSchema() - api/src/utils/get-schema.ts                          │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │ 1. 缓存检查: getMemorySchemaCache()                         │    │   │
+│  │  │    - 检查内存缓存 (freezeSchema / unfreezeSchema)          │    │   │
+│  │  │    - 支持 CACHE_SCHEMA 环境变量控制                         │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                              │                                         │   │
+│  │                              ▼ (缓存未命中)                            │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │ 2. 分布式锁: useLock()                                       │    │   │
+│  │  │    - lockKey = 'schemaCache--preparing'                     │    │   │
+│  │  │    - 防止多进程/多实例重复构建                                │    │   │
+│  │  │    - processId === 1 时才真正执行构建                       │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                              │                                         │   │
+│  │                              ▼ (非首个进程)                            │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │ 3. 进程间通信: useBus()                                      │    │   │
+│  │  │    - messageKey = 'schemaCache--done'                       │    │   │
+│  │  │    - 非首个进程订阅消息，等待首个进程完成                     │    │   │
+│  │  │    - 超时机制: CACHE_SCHEMA_SYNC_TIMEOUT                    │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         方言分派层 (Dialect Dispatch)                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  createInspector() - packages/schema/src/index.ts                   │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │ 根据 knex.client.constructor.name 选择方言:                  │    │   │
+│  │  │  - Client_PG          → PostgresSchemaInspector             │    │   │
+│  │  │  - Client_MySQL/2     → MySQLSchemaInspector                │    │   │
+│  │  │  - Client_SQLite3     → SqliteSchemaInspector               │    │   │
+│  │  │  - Client_MSSQL       → MSSQLSchemaInspector                │    │   │
+│  │  │  - Client_CockroachDB → CockroachDBSchemaInspector         │    │   │
+│  │  │  - Client_Oracledb    → OracleDBSchemaInspector             │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          结构回填层 (Schema Hydration)                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  getDatabaseSchema() - api/src/utils/get-schema.ts                  │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │ 1. 原生结构读取                                               │    │   │
+│  │  │    - inspector.overview() → 获取表/列/主键的原始结构        │    │   │
+│  │  │    - 返回 SchemaOverview (方言层输出格式)                    │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                              │                                         │   │
+│  │                              ▼                                         │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │ 2. Directus 元数据合并                                       │    │   │
+│  │  │    - directus_collections → 集合配置 (singleton, note 等)  │    │   │
+│  │  │    - directus_fields → 字段配置 (special, validation 等)   │    │   │
+│  │  │    - systemCollectionRows → 系统集合默认配置                 │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                              │                                         │   │
+│  │                              ▼                                         │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │ 3. 类型归一化                                                │    │   │
+│  │  │    - getLocalType() → 将数据库类型映射为 Directus 类型      │    │   │
+│  │  │    - getDefaultValue() → 解析并转换默认值格式               │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                              │                                         │   │
+│  │                              ▼                                         │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │ 4. 关系信息补充                                              │    │   │
+│  │  │    - RelationsService.readAll() → 从 directus_relations 读取│    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2. 关键文件位置
+### 2. 统一层与方言层的边界定义
+
+| 层级 | 职责范围 | 输入 | 输出 | 关键文件 |
+|------|---------|------|------|---------|
+| **方言层** | 数据库特有元数据查询 | Knex 连接 | `SchemaOverview` (原生结构) | `packages/schema/src/dialects/*.ts` |
+| **统一层** | 类型归一、元数据合并、缓存管理 | `SchemaOverview` + Directus 元数据 | `SchemaOverview` (完整 Directus schema) | `api/src/utils/get-schema.ts`, `api/src/utils/get-local-type.ts` |
+
+#### 方言层的职责边界
+
+方言层**只负责**：
+1. 执行数据库特有的 SQL 查询获取元数据
+2. 将查询结果转换为统一的 `Column`/`Table`/`ForeignKey` 接口格式
+3. 处理数据库特有的格式差异（如 PostgreSQL 的 `::type` 后缀）
+
+方言层**不负责**：
+1. 类型归一化（不将 `varchar` 映射为 `string`）
+2. 与 Directus 元数据合并
+3. 缓存管理
+4. 并发控制
+
+#### 统一层的职责边界
+
+统一层**负责**：
+1. 缓存读取与写入
+2. 分布式锁与进程同步
+3. 从 `directus_collections`/`directus_fields` 读取元数据
+4. 类型归一化 (`getLocalType()`)
+5. 默认值解析 (`getDefaultValue()`)
+6. 关系信息补充
+
+### 3. 关键文件位置
 
 | 组件 | 文件路径 | 说明 |
 |------|---------|------|
-| 核心接口 | `packages/schema/src/types/schema-inspector.ts` | SchemaInspector 接口定义 |
-| 类型定义 | `packages/schema/src/types/*.ts` | Column, Table, ForeignKey 等类型 |
-| 工厂函数 | `packages/schema/src/index.ts` | createInspector() |
-| Postgres 实现 | `packages/schema/src/dialects/postgres.ts` | PostgreSQL 方言 |
-| MySQL 实现 | `packages/schema/src/dialects/mysql.ts` | MySQL 方言 |
-| SQLite 实现 | `packages/schema/src/dialects/sqlite.ts` | SQLite 方言 |
-| MSSQL 实现 | `packages/schema/src/dialects/mssql.ts` | SQL Server 方言 |
-| API 服务层 | `api/src/services/schema.ts` | SchemaService |
-| 快照工具 | `api/src/utils/get-snapshot.ts` | getSnapshot() |
+| 请求入口 | `api/src/middleware/schema.ts` | Express 中间件，自动加载 schema |
+| 缓存与并发 | `api/src/utils/get-schema.ts` | `getSchema()` 核心逻辑 |
+| 方言工厂 | `packages/schema/src/index.ts` | `createInspector()` |
+| 类型归一 | `api/src/utils/get-local-type.ts` | `getLocalType()` |
+| 默认值处理 | `api/src/utils/get-default-value.ts` | `getDefaultValue()` |
+| 核心接口 | `packages/schema/src/types/schema-inspector.ts` | SchemaInspector 接口 |
+
+---
+
+## 完整调用链详解
+
+### 阶段 1: 请求入口
+
+**文件**: `api/src/middleware/schema.ts:1-10`
+
+每个 HTTP 请求到达时，Express 中间件自动触发 schema 加载：
+
+```typescript
+const schema: RequestHandler = asyncHandler(async (req, _res, next) => {
+    req.schema = await getSchema();  // 核心入口
+    return next();
+});
+```
+
+**调用时机**:
+- 每个 API 请求都会执行
+- `req.schema` 在后续的 Service 层和 Controller 层中使用
+
+### 阶段 2: 缓存与并发控制
+
+**文件**: `api/src/utils/get-schema.ts:22-114`
+
+这是最复杂的一层，处理多进程/多实例场景下的缓存与并发：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    getSchema() 执行流程                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐                                               │
+│  │ 1. 检查配置   │                                               │
+│  │ bypassCache?  │ ──Yes──→ 跳过缓存，直接查询数据库            │
+│  │ CACHE_SCHEMA? │                                               │
+│  └──────┬───────┘                                               │
+│         │ No                                                    │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │ 2. 内存缓存   │                                               │
+│  │              │ ──命中──→ 直接返回缓存数据                    │
+│  │ getMemory    │                                               │
+│  │ SchemaCache  │                                               │
+│  └──────┬───────┘                                               │
+│         │ Miss                                                  │
+│         ▼                                                       │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 3. 分布式锁竞争 (useLock)                                  │ │
+│  │                                                           │ │
+│  │   lockKey = 'schemaCache--preparing'                     │ │
+│  │   processId = lock.increment(lockKey)                    │ │
+│  │                                                           │ │
+│  │   ┌─────────────────┐      ┌─────────────────────────┐  │ │
+│  │   │ processId === 1 │      │ processId >= 2          │  │ │
+│  │   │ (首个进程)       │      │ (等待进程)               │  │ │
+│  │   └────────┬────────┘      └───────────┬─────────────┘  │ │
+│  │            │                            │                  │ │
+│  │            ▼                            ▼                  │ │
+│  │   ┌────────────────┐         ┌───────────────────────┐   │ │
+│  │   │ 实际执行构建   │         │ 订阅消息等待完成      │   │ │
+│  │   │                │         │                       │   │ │
+│  │   │ getDatabase    │         │ bus.subscribe(        │   │ │
+│  │   │ Schema()       │         │   'schemaCache--done' │   │ │
+│  │   │                │         │ )                      │   │ │
+│  │   │ setMemory      │         │ 超时: CACHE_SCHEMA_   │   │ │
+│  │   │ SchemaCache()  │         │ SYNC_TIMEOUT          │   │ │
+│  │   └────────┬───────┘         └───────────┬───────────┘   │ │
+│  │            │                            │                  │ │
+│  │            └────────────┬───────────────┘                  │ │
+│  │                         ▼                                  │ │
+│  │            ┌────────────────────────┐                      │ │
+│  │            │ 4. 广播完成消息        │                      │ │
+│  │            │ bus.publish(           │                      │ │
+│  │            │   'schemaCache--done', │                      │ │
+│  │            │   { schema }           │                      │ │
+│  │            │ )                      │                      │ │
+│  │            └────────────┬───────────┘                      │ │
+│  │                         ▼                                  │ │
+│  │            ┌────────────────────────┐                      │ │
+│  │            │ 5. 释放锁              │                      │ │
+│  │            │ lock.delete(lockKey)   │                      │ │
+│  │            └────────────────────────┘                      │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码片段**:
+
+```typescript
+export async function getSchema(options?, attempt = 0): Promise<SchemaOverview> {
+    // 1. 缓存检查
+    if (options?.bypassCache || env['CACHE_SCHEMA'] === false) {
+        // 跳过缓存，直接查询
+        const schemaInspector = createInspector(database);
+        return await getDatabaseSchema(database, schemaInspector);
+    }
+
+    const cached = getMemorySchemaCache();
+    if (cached) return cached;  // 缓存命中
+
+    // 2. 分布式锁
+    const lock = useLock();
+    const bus = useBus();
+    const lockKey = 'schemaCache--preparing';
+    const messageKey = 'schemaCache--done';
+    const processId = await lock.increment(lockKey);
+
+    // 3. 非首个进程：等待消息
+    if (processId !== 1) {
+        const subscription = new Promise((resolve, reject) => {
+            bus.subscribe(messageKey, (options) => {
+                // 收到首个进程完成的消息
+                setMemorySchemaCache(options.schema);
+                resolve(options.schema);
+            });
+        });
+        // 超时后重试
+        return Promise.race([timeout, subscription])
+            .catch(() => getSchema(options, attempt + 1));
+    }
+
+    // 4. 首个进程：实际执行构建
+    try {
+        const schemaInspector = createInspector(database);
+        schema = await getDatabaseSchema(database, schemaInspector);
+        setMemorySchemaCache(schema);
+        return schema;
+    } finally {
+        // 5. 广播完成消息
+        await bus.publish(messageKey, { schema });
+        await lock.delete(lockKey);
+    }
+}
+```
+
+### 阶段 3: 方言分派
+
+**文件**: `packages/schema/src/index.ts:16-46`
+
+根据 Knex 客户端类型选择对应的方言实现：
+
+```typescript
+export const createInspector = (knex: Knex): SchemaInspector => {
+    let constructor: SchemaInspectorConstructor;
+
+    switch (knex.client.constructor.name) {
+        case 'Client_MySQL':
+        case 'Client_MySQL2':
+            constructor = MySQLSchemaInspector;
+            break;
+        case 'Client_PG':
+            constructor = PostgresSchemaInspector;
+            break;
+        // ... 其他方言
+    }
+
+    return new constructor(knex);
+};
+```
+
+**分派依据**:
+- `knex.client.constructor.name` - Knex 客户端的构造函数名称
+- 例如 PostgreSQL 使用 `Client_PG`，MySQL 使用 `Client_MySQL`
+
+### 阶段 4: 结构回填
+
+**文件**: `api/src/utils/get-schema.ts:116-232`
+
+这是将数据库原生结构转换为 Directus 可用结构的关键步骤：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    getDatabaseSchema() 执行流程                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ Step 1: 读取原生数据库结构                                    │  │
+│  │                                                              │  │
+│  │   const schemaOverview = await schemaInspector.overview();  │  │
+│  │                                                              │  │
+│  │   输出格式 (SchemaOverview):                                 │  │
+│  │   {                                                          │  │
+│  │     "users": {                                               │  │
+│  │       primary: "id",                                         │  │
+│  │       columns: {                                             │  │
+│  │         "id": {                                              │  │
+│  │           data_type: "integer",      // 数据库原生类型       │  │
+│  │           default_value: "nextval(...)", // 原生格式         │  │
+│  │           is_nullable: false,                                │  │
+│  │           ...                                                │  │
+│  │         }                                                    │  │
+│  │       }                                                      │  │
+│  │     }                                                        │  │
+│  │   }                                                          │  │
+│  └───────────────────────┬─────────────────────────────────────┘  │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ Step 2: 合并 Directus 元数据                                 │  │
+│  │                                                              │  │
+│  │   // 从 directus_collections 读取集合配置                    │  │
+│  │   const collections = [                                      │  │
+│  │     ...await database.select(...).from('directus_collections'),│
+│  │     ...systemCollectionRows  // 系统集合默认配置              │  │
+│  │   ];                                                         │  │
+│  │                                                              │  │
+│  │   // 从 directus_fields 读取字段配置                         │  │
+│  │   const fields = [                                           │  │
+│  │     ...await database.select(...).from('directus_fields'), │  │
+│  │     ...systemFieldRows                                       │  │
+│  │   ];                                                         │  │
+│  └───────────────────────┬─────────────────────────────────────┘  │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ Step 3: 类型归一化 (核心转换)                                │  │
+│  │                                                              │  │
+│  │   遍历每个集合和字段，执行以下转换：                         │  │
+│  │                                                              │  │
+│  │   fields: mapValues(columns, (column) => {                 │  │
+│  │     return {                                                 │  │
+│  │       // 数据库原生值                                        │  │
+│  │       dbType: column.data_type,        // "character varying"│
+│  │       precision: column.numeric_precision, // null          │  │
+│  │       scale: column.numeric_scale,      // null             │  │
+│  │                                                              │  │
+│  │       // 归一化后的值                                        │  │
+│  │       type: getLocalType(column),       // "string"         │  │
+│  │       defaultValue: getDefaultValue(column), // 解析后的值  │  │
+│  │       nullable: column.is_nullable,      // true/false      │  │
+│  │       generated: column.is_generated,    // true/false      │  │
+│  │       ...                                                    │  │
+│  │     };                                                        │  │
+│  │   })                                                          │  │
+│  └───────────────────────┬─────────────────────────────────────┘  │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ Step 4: 补充 Directus 字段配置                               │  │
+│  │                                                              │  │
+│  │   遍历 directus_fields 中的记录，覆盖或补充字段配置：        │  │
+│  │                                                              │  │
+│  │   for (const field of fields) {                             │  │
+│  │     const special = toArray(field.special); // ["cast-json"]│
+│  │                                                              │  │
+│  │     // special 影响类型判断                                  │  │
+│  │     const type = getLocalType(column, { special });         │  │
+│  │                                                              │  │
+│  │     result.collections[field.collection]!.fields[field.field] = {│
+│  │       special: special,              // ["cast-json"]       │  │
+│  │       note: field.note,              // 用户添加的备注       │  │
+│  │       validation: field.validation,   // JSON 验证规则       │  │
+│  │       alias: !existing?.dbType,       // 是否为虚拟字段      │  │
+│  │       ...                                                      │  │
+│  │     };                                                          │  │
+│  │   }                                                             │  │
+│  └───────────────────────┬─────────────────────────────────────┘  │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ Step 5: 补充关系信息                                          │  │
+│  │                                                              │  │
+│  │   const relationsService = new RelationsService({            │  │
+│  │     knex: database,                                          │  │
+│  │     schema: result                                           │  │
+│  │   });                                                         │  │
+│  │                                                              │  │
+│  │   // 从 directus_relations 表读取所有关系                    │  │
+│  │   result.relations = await relationsService.readAll();       │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码片段**:
+
+```typescript
+async function getDatabaseSchema(database: Knex, schemaInspector: SchemaInspector): Promise<SchemaOverview> {
+    const result: SchemaOverview = {
+        collections: {},
+        relations: [],
+    };
+
+    // Step 1: 读取原生结构
+    const schemaOverview = await schemaInspector.overview();
+
+    // Step 2: 读取 Directus 元数据
+    const collections = [
+        ...(await database.select(...).from('directus_collections')),
+        ...systemCollectionRows,
+    ];
+
+    const fields = [
+        ...(await database.select(...).from('directus_fields')),
+        ...systemFieldRows,
+    ];
+
+    // Step 3: 遍历集合，构建完整结构
+    for (const [collection, info] of Object.entries(schemaOverview)) {
+        // 跳过排除的表
+        if (toArray(env['DB_EXCLUDE_TABLES']).includes(collection)) continue;
+
+        const collectionMeta = collections.find(c => c.collection === collection);
+
+        result.collections[collection] = {
+            collection,
+            primary: info.primary,
+            singleton: toBoolean(collectionMeta?.singleton),
+            note: collectionMeta?.note || null,
+            accountability: collectionMeta?.accountability || 'all',
+            
+            // 类型归一化的核心位置
+            fields: mapValues(info.columns, (column) => {
+                return {
+                    field: column.column_name,
+                    // 数据库原生类型
+                    dbType: column.data_type,
+                    precision: column.numeric_precision || null,
+                    scale: column.numeric_scale || null,
+                    // 归一化后的 Directus 类型
+                    type: getLocalType(column),
+                    // 解析后的默认值
+                    defaultValue: getDefaultValue(column) ?? null,
+                    // 其他属性
+                    nullable: column.is_nullable ?? true,
+                    generated: column.is_generated ?? false,
+                    special: [],
+                    alias: false,
+                    searchable: true,
+                };
+            }),
+        };
+    }
+
+    // Step 4: 应用 Directus 字段配置
+    for (const field of fields) {
+        if (!result.collections[field.collection]) continue;
+        
+        const existing = result.collections[field.collection]?.fields[field.field];
+        const column = schemaOverview[field.collection]?.columns[field.field];
+        const special = field.special ? toArray(field.special) : [];
+
+        // special 会影响类型判断
+        const type = (existing && getLocalType(column, { special })) || 'alias';
+
+        result.collections[field.collection]!.fields[field.field] = {
+            ...existing,
+            special: special,
+            note: field.note,
+            validation: parseJSON(field.validation) ?? null,
+            alias: existing?.alias ?? true,
+            searchable: toBoolean(field.searchable) ?? true,
+        };
+    }
+
+    // Step 5: 补充关系信息
+    const relationsService = new RelationsService({ knex: database, schema: result });
+    result.relations = await relationsService.readAll();
+
+    return result;
+}
+```
+
+---
+
+## PostgreSQL 与 MySQL 对照示例
+
+### 场景说明
+
+假设我们有一张 `users` 表，在两个数据库中的定义如下：
+
+**PostgreSQL DDL**:
+```sql
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) NOT NULL DEFAULT 'unknown@example.com',
+    is_active BOOLEAN DEFAULT true,
+    status VARCHAR(20) DEFAULT 'active',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    score NUMERIC(10,2) DEFAULT 0.00
+);
+```
+
+**MySQL DDL**:
+```sql
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL DEFAULT 'unknown@example.com',
+    is_active TINYINT(1) DEFAULT 1,
+    status VARCHAR(20) DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    metadata JSON DEFAULT '{}',
+    score DECIMAL(10,2) DEFAULT 0.00
+);
+```
+
+### 对照 1: 方言层输出 (SchemaInspector.overview())
+
+#### PostgreSQL 方言层输出
+
+**文件**: `packages/schema/src/dialects/postgres.ts:86-230`
+
+```typescript
+// schemaInspector.overview() 返回的原始数据
+{
+  "users": {
+    "primary": "id",
+    "columns": {
+      "id": {
+        "table_name": "users",
+        "column_name": "id",
+        "data_type": "integer",
+        "default_value": "AUTO_INCREMENT",  // 方言层已转换: 原来是 nextval('users_id_seq'::regclass)
+        "is_nullable": false,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": 32,
+        "numeric_scale": 0
+      },
+      "email": {
+        "table_name": "users",
+        "column_name": "email",
+        "data_type": "character varying",
+        "default_value": "unknown@example.com",  // 方言层已解析: 原来是 'unknown@example.com'::character varying
+        "is_nullable": false,
+        "is_generated": false,
+        "max_length": 255,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "is_active": {
+        "table_name": "users",
+        "column_name": "is_active",
+        "data_type": "boolean",
+        "default_value": "true",  // 方言层直接返回
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "status": {
+        "table_name": "users",
+        "column_name": "status",
+        "data_type": "character varying",
+        "default_value": "active",
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": 20,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "created_at": {
+        "table_name": "users",
+        "column_name": "created_at",
+        "data_type": "timestamp with time zone",
+        "default_value": "now()",  // 方言层解析后
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "metadata": {
+        "table_name": "users",
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "default_value": "{}",  // 原来是 '{}'::jsonb
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "score": {
+        "table_name": "users",
+        "column_name": "score",
+        "data_type": "numeric",
+        "default_value": "0.00",
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": 10,
+        "numeric_scale": 2
+      }
+    }
+  }
+}
+```
+
+**PostgreSQL 方言层的关键转换**:
+
+```typescript
+// 1. 自增列检测: 检查 default_value 是否以 nextval( 开头
+if (column.is_identity || column.default_value?.startsWith('nextval(')) {
+    column.default_value = 'AUTO_INCREMENT';
+}
+
+// 2. 默认值解析: 移除 PostgreSQL 特有的类型转换后缀
+export function parseDefaultValue(value: string | null): string | null {
+    if (value === null) return null;
+    if (value.startsWith('nextval(')) return value;  // 保留序列引用
+    
+    // 移除 :: 类型后缀: 'text'::character varying => 'text'
+    value = value.split('::')[0] ?? null;
+    
+    if (value?.trim().toLowerCase() === 'null') return null;
+    return stripQuotes(value);
+}
+```
+
+#### MySQL 方言层输出
+
+**文件**: `packages/schema/src/dialects/mysql.ts:83-137`
+
+```typescript
+// schemaInspector.overview() 返回的原始数据
+{
+  "users": {
+    "primary": "id",
+    "columns": {
+      "id": {
+        "table_name": "users",
+        "column_name": "id",
+        "data_type": "int",
+        "default_value": "AUTO_INCREMENT",  // 方言层检测: EXTRA = 'auto_increment'
+        "is_nullable": false,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": null,
+        "numeric_scale": null,
+        "column_key": "PRI",
+        "extra": "auto_increment"
+      },
+      "email": {
+        "table_name": "users",
+        "column_name": "email",
+        "data_type": "varchar",
+        "default_value": "unknown@example.com",
+        "is_nullable": false,
+        "is_generated": false,
+        "max_length": 255,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "is_active": {
+        "table_name": "users",
+        "column_name": "is_active",
+        "data_type": "boolean",  // 方言层已转换: 原来是 tinyint(1)
+        "default_value": "1",
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": null,
+        "numeric_scale": null,
+        "column_type": "tinyint(1)"  // 原始类型
+      },
+      "status": {
+        "table_name": "users",
+        "column_name": "status",
+        "data_type": "varchar",
+        "default_value": "active",
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": 20,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "created_at": {
+        "table_name": "users",
+        "column_name": "created_at",
+        "data_type": "timestamp",
+        "default_value": "CURRENT_TIMESTAMP",
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "metadata": {
+        "table_name": "users",
+        "column_name": "metadata",
+        "data_type": "json",
+        "default_value": "{}",
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": null,
+        "numeric_scale": null
+      },
+      "score": {
+        "table_name": "users",
+        "column_name": "score",
+        "data_type": "decimal",
+        "default_value": "0.00",
+        "is_nullable": true,
+        "is_generated": false,
+        "max_length": null,
+        "numeric_precision": 10,
+        "numeric_scale": 2
+      }
+    }
+  }
+}
+```
+
+**MySQL 方言层的关键转换**:
+
+```typescript
+// 1. 自增列检测: 检查 EXTRA 字段
+if (column.extra === 'auto_increment') {
+    column.default_value = 'AUTO_INCREMENT';
+}
+
+// 2. 布尔类型约定: tinyint(1) => boolean
+let dataType = column.data_type.replace(/\(.*?\)/, '');
+if (column.data_type.startsWith('tinyint(1)')) {
+    dataType = 'boolean';
+}
+
+// 3. 默认值解析 (较简单，没有类型后缀)
+export function parseDefaultValue(value: string | null): string | null {
+    if (value === null || value.trim().toLowerCase() === 'null') return null;
+    return stripQuotes(value);
+}
+```
+
+### 对照 2: 类型归一化 (getLocalType)
+
+**文件**: `api/src/utils/get-local-type.ts:105-153`
+
+这是统一层的核心功能，将数据库原生类型映射为 Directus 标准类型。
+
+#### 类型映射对照表
+
+| 字段 | PostgreSQL 原生类型 | MySQL 原生类型 | getLocalType 输出 |
+|------|---------------------|----------------|-------------------|
+| id | `integer` | `int` | `integer` |
+| email | `character varying` | `varchar` | `string` |
+| is_active | `boolean` | `boolean` (从 tinyint(1) 转换) | `boolean` |
+| status | `character varying` | `varchar` | `string` |
+| created_at | `timestamp with time zone` | `timestamp` | `timestamp` |
+| metadata | `jsonb` | `json` | `json` |
+| score | `numeric` (precision=10, scale=2) | `decimal` (precision=10, scale=2) | `decimal` |
+
+#### 归一化代码流程
+
+```typescript
+// getLocalType 的核心逻辑
+const localTypeMap: Record<string, Type | 'unknown'> = {
+    // 共享类型
+    boolean: 'boolean',
+    integer: 'integer',
+    int: 'integer',
+    varchar: 'string',
+    timestamp: 'timestamp',
+    json: 'json',
+    decimal: 'decimal',
+    numeric: 'integer',  // 默认映射为 integer，但有特殊处理
+    
+    // PostgreSQL 特有
+    'character varying': 'string',
+    bool: 'boolean',
+    jsonb: 'json',
+    'timestamp with time zone': 'timestamp',
+    int4: 'integer',
+    
+    // MySQL 特有
+    tinyint: 'integer',
+    text: 'text',
+    datetime: 'dateTime',
+};
+
+export default function getLocalType(column?, field?): Type | 'unknown' {
+    if (!column) return 'alias';
+    
+    const dataType = column.data_type.toLowerCase();
+    // 移除括号中的长度信息: varchar(255) => varchar
+    const type = localTypeMap[dataType.split('(')[0]!];
+    
+    // 特殊情况 1: PostgreSQL numeric 带 precision/scale => decimal
+    if (dataType === 'numeric' && 
+        column.numeric_precision !== null && 
+        column.numeric_scale !== null) {
+        return 'decimal';
+    }
+    
+    // 特殊情况 2: special 字段覆盖类型
+    const special = field?.special;
+    if (special) {
+        if (special.includes('cast-json')) return 'json';
+        if (special.includes('uuid')) return 'uuid';
+        if (special.includes('cast-timestamp')) return 'timestamp';
+        // ...
+    }
+    
+    return type ?? 'unknown';
+}
+```
+
+#### 关键差异点
+
+**1. 字符串类型**
+- PostgreSQL: `character varying` → `string`
+- MySQL: `varchar` → `string`
+- 两者最终都映射为 `string`
+
+**2. 布尔类型**
+- PostgreSQL: 原生 `boolean` → `boolean`
+- MySQL: 方言层先将 `tinyint(1)` 转换为 `boolean`，然后统一层映射为 `boolean`
+- 注意: MySQL 的转换发生在**方言层**，而不是统一层
+
+**3. 时间戳类型**
+- PostgreSQL: `timestamp with time zone` → `timestamp`
+- PostgreSQL: `timestamp without time zone` → `dateTime`
+- MySQL: `timestamp` → `timestamp`
+- MySQL: `datetime` → `dateTime`
+
+**4. 数值类型 (最复杂)**
+- PostgreSQL:
+  - `numeric` 无 precision/scale → `integer` (默认)
+  - `numeric(10,2)` → `decimal` (特殊处理)
+- MySQL:
+  - `decimal` → `decimal`
+  - `decimal(10,2)` → `decimal`
+
+### 对照 3: 默认值解析 (getDefaultValue)
+
+**文件**: `api/src/utils/get-default-value.ts:8-65`
+
+这是统一层的另一个核心功能，根据归一化后的类型转换默认值格式。
+
+#### 默认值对照
+
+| 字段 | PostgreSQL 方言层输出 | MySQL 方言层输出 | getDefaultValue 输出 |
+|------|----------------------|-----------------|---------------------|
+| id | `"AUTO_INCREMENT"` | `"AUTO_INCREMENT"` | `"AUTO_INCREMENT"` (特殊值) |
+| email | `"unknown@example.com"` | `"unknown@example.com"` | `"unknown@example.com"` |
+| is_active | `"true"` | `"1"` | `true` (布尔值) |
+| status | `"active"` | `"active"` | `"active"` |
+| created_at | `"now()"` | `"CURRENT_TIMESTAMP"` | `"now()"` / `"CURRENT_TIMESTAMP"` (保留原始) |
+| metadata | `"{}"` | `"{}"` | `{}` (解析为对象) |
+| score | `"0.00"` | `"0.00"` | `0.00` (数字) |
+
+#### 解析代码流程
+
+```typescript
+export default function getDefaultValue(column, field?): any {
+    const type = getLocalType(column, field);  // 先获取归一化类型
+    const defaultValue = column.default_value ?? null;
+    
+    // 特殊情况: MySQL 的零日期
+    if (defaultValue === '0000-00-00 00:00:00') return null;
+    
+    // 根据类型转换
+    switch (type) {
+        case 'bigInteger':
+        case 'integer':
+        case 'decimal':
+        case 'float':
+            // 字符串转数字
+            return Number.isNaN(Number(defaultValue)) === false 
+                ? Number(defaultValue) 
+                : defaultValue;
+        
+        case 'boolean':
+            // 各种格式转布尔
+            return castToBoolean(defaultValue);
+        
+        case 'json':
+            // 字符串解析为对象
+            return castToObject(defaultValue);
+        
+        default:
+            // 其他类型保持原样
+            return defaultValue;
+    }
+}
+
+// 布尔值转换 (处理多种格式)
+function castToBoolean(value: any): boolean {
+    if (typeof value === 'boolean') return value;
+    
+    // 数字格式
+    if (value === 0 || value === '0') return false;
+    if (value === 1 || value === '1') return true;
+    
+    // 字符串格式
+    if (value === 'false' || value === false) return false;
+    if (value === 'true' || value === true) return true;
+    
+    return Boolean(value);
+}
+
+// JSON 解析
+function castToObject(value: any): any {
+    if (typeof value === 'object') return value;
+    if (typeof value === 'string') {
+        try {
+            return parseJSON(value);
+        } catch (err) {
+            return value;
+        }
+    }
+    return {};
+}
+```
+
+#### 关键差异点
+
+**1. 自增列标记**
+- 两个数据库的方言层都将自增列的 default_value 设为 `"AUTO_INCREMENT"`
+- 统一层保留这个特殊值，不进行类型转换
+
+**2. 布尔值差异**
+- PostgreSQL 方言层输出 `"true"` 或 `"false"` (字符串)
+- MySQL 方言层输出 `"1"` 或 `"0"` (字符串)
+- 统一层的 `castToBoolean` 函数处理这两种格式：
+  - `"true"` → `true`
+  - `"1"` → `true`
+  - `"false"` → `false`
+  - `"0"` → `false`
+
+**3. JSON 类型**
+- 两个数据库的方言层都输出 `"{}"` (字符串)
+- 统一层解析为实际对象 `{}`
+
+**4. 数值类型**
+- PostgreSQL: `"0.00"` (字符串) → `0.00` (数字)
+- MySQL: `"0.00"` (字符串) → `0.00` (数字)
+- 两者处理方式相同
+
+**5. 函数默认值**
+- PostgreSQL: `"now()"`
+- MySQL: `"CURRENT_TIMESTAMP"`
+- 统一层不解析这些函数调用，保持原样返回
+
+### 对照 4: 最终输出对比
+
+经过统一层处理后，两个数据库的 `users` 表结构几乎完全一致：
+
+```typescript
+// PostgreSQL 和 MySQL 处理后的输出 (几乎相同)
+{
+  "collections": {
+    "users": {
+      "collection": "users",
+      "primary": "id",
+      "singleton": false,
+      "note": null,
+      "accountability": "all",
+      "fields": {
+        "id": {
+          "field": "id",
+          "type": "integer",        // 归一化类型
+          "dbType": "integer",      // PostgreSQL: "integer", MySQL: "int"
+          "defaultValue": "AUTO_INCREMENT",
+          "nullable": false,
+          "generated": false,
+          "precision": 32,          // PostgreSQL: 32, MySQL: null
+          "scale": 0,               // PostgreSQL: 0, MySQL: null
+          "special": [],
+          "alias": false,
+          "searchable": true
+        },
+        "email": {
+          "field": "email",
+          "type": "string",         // 归一化类型
+          "dbType": "character varying",  // PostgreSQL
+          // "dbType": "varchar",         // MySQL (唯一的差异点)
+          "defaultValue": "unknown@example.com",
+          "nullable": false,
+          "generated": false,
+          "maxLength": 255,
+          "special": [],
+          "alias": false,
+          "searchable": true
+        },
+        "is_active": {
+          "field": "is_active",
+          "type": "boolean",        // 归一化类型
+          "dbType": "boolean",      // PostgreSQL: "boolean", MySQL: "boolean" (从 tinyint(1) 转换)
+          "defaultValue": true,     // 统一后的布尔值
+          "nullable": true,
+          "generated": false,
+          "special": [],
+          "alias": false,
+          "searchable": true
+        },
+        "metadata": {
+          "field": "metadata",
+          "type": "json",           // 归一化类型
+          "dbType": "jsonb",        // PostgreSQL: "jsonb", MySQL: "json"
+          "defaultValue": {},       // 解析后的对象
+          "nullable": true,
+          "generated": false,
+          "special": [],
+          "alias": false,
+          "searchable": true
+        },
+        "score": {
+          "field": "score",
+          "type": "decimal",        // 归一化类型
+          "dbType": "numeric",      // PostgreSQL: "numeric", MySQL: "decimal"
+          "defaultValue": 0.00,     // 解析后的数字
+          "nullable": true,
+          "generated": false,
+          "precision": 10,
+          "scale": 2,
+          "special": [],
+          "alias": false,
+          "searchable": true
+        }
+      }
+    }
+  },
+  "relations": []
+}
+```
+
+### 对照总结
+
+| 转换阶段 | PostgreSQL | MySQL | 统一后 |
+|---------|-----------|-------|--------|
+| **方言层 - 自增列** | `nextval('seq'::regclass)` → `"AUTO_INCREMENT"` | `EXTRA='auto_increment'` → `"AUTO_INCREMENT"` | `"AUTO_INCREMENT"` |
+| **方言层 - 布尔类型** | 原生 `boolean` | `tinyint(1)` → `boolean` | `boolean` |
+| **方言层 - 默认值** | `'text'::varchar` → `"text"` | `'text'` → `"text"` | `"text"` |
+| **统一层 - 类型映射** | `character varying` → `string` | `varchar` → `string` | `string` |
+| **统一层 - 类型映射** | `timestamp with time zone` → `timestamp` | `timestamp` → `timestamp` | `timestamp` |
+| **统一层 - 类型映射** | `numeric(10,2)` → `decimal` | `decimal(10,2)` → `decimal` | `decimal` |
+| **统一层 - 默认值解析** | `"true"` → `true` | `"1"` → `true` | `true` |
+| **统一层 - 默认值解析** | `"{}"` → `{}` | `"{}"` → `{}` | `{}` |
+| **统一层 - 默认值解析** | `"0.00"` → `0.00` | `"0.00"` → `0.00` | `0.00` |
+
+**关键设计原则**:
+1. **方言层**处理数据库特有的语法和格式差异
+2. **统一层**负责将方言层输出映射为 Directus 标准类型
+3. `dbType` 字段保留原始数据库类型用于调试
+4. `type` 字段是 Directus 内部使用的标准类型
+
+---
+
+## (以下为原有内容，保持不变)
 
 ## SchemaInspector 接口定义
 
@@ -580,124 +1608,4 @@ const foreignKeys = await inspector.foreignKeys('articles');
 
 ### 2. 自增列检测
 | 数据库 | 检测方式 |
-|--------|---------|
-| PostgreSQL | `default_value` 以 `nextval(` 开头，或 `is_identity` |
-| MySQL | `EXTRA = 'auto_increment'` |
-| SQLite | 表的 `CREATE TABLE` SQL 包含 `AUTOINCREMENT` 关键字 |
-| MSSQL | `COLUMNPROPERTY(..., 'IsIdentity') = 1` |
-
-### 3. 布尔类型处理
-| 数据库 | 存储方式 | 转换策略 |
-|--------|---------|---------|
-| PostgreSQL | `boolean` 原生类型 | 直接识别 |
-| MySQL | `tinyint(1)` 约定 | 检测类型定义，转换为 `boolean` |
-| SQLite | 无原生布尔类型 | 使用 `INTEGER` 存储，0/1 |
-| MSSQL | `bit` 类型 | 直接识别 |
-
-### 4. Unicode 长度计算
-**MSSQL 特有问题**:
-- `varchar(100)` → `max_length = 100` (单字节)
-- `nvarchar(100)` → `max_length = 200` (双字节，需要除以 2)
-- `nvarchar(MAX)` → `max_length = -1` (表示无限制)
-
-## 扩展新数据库方言的指南
-
-如果需要添加新的数据库支持，需要:
-
-### 1. 创建方言类
-```typescript
-// packages/schema/src/dialects/newdb.ts
-import type { Knex } from 'knex';
-import type { SchemaInspector } from '../types/schema-inspector.js';
-
-export default class NewDBSchemaInspector implements SchemaInspector {
-    knex: Knex;
-
-    constructor(knex: Knex) {
-        this.knex = knex;
-    }
-
-    // 实现所有必需方法
-    async overview(): Promise<SchemaOverview> { /* ... */ }
-    async tables(): Promise<string[]> { /* ... */ }
-    async tableInfo(): Promise<Table[]> { /* ... */ }
-    async hasTable(table: string): Promise<boolean> { /* ... */ }
-    async columns(table?: string): Promise<TableColumn[]> { /* ... */ }
-    async columnInfo(table?: string, column?: string): Promise<any> { /* ... */ }
-    async hasColumn(table: string, column: string): Promise<boolean> { /* ... */ }
-    async primary(table: string): Promise<string | null> { /* ... */ }
-    async foreignKeys(table?: string): Promise<ForeignKey[]> { /* ... */ }
-}
-```
-
-### 2. 注册到工厂函数
-```typescript
-// packages/schema/src/index.ts
-import NewDBSchemaInspector from './dialects/newdb.js';
-
-export const createInspector = (knex: Knex): SchemaInspector => {
-    switch (knex.client.constructor.name) {
-        // ... 现有 case
-        case 'Client_NewDB':  // Knex 客户端的构造函数名
-            constructor = NewDBSchemaInspector;
-            break;
-        // ...
-    }
-};
-```
-
-### 3. 关键实现要点
-1. **统一类型映射**: 将数据库特有类型映射到 Directus 通用类型
-2. **默认值解析**: 处理数据库特有的默认值格式
-3. **自增检测**: 正确识别自增列
-4. **外键读取**: 正确解析外键关系
-5. **性能优化**: 尽可能使用批量查询，避免 N+1 问题
-
-## 性能考量
-
-### 1. PostgreSQL 的批量查询
-PostgreSQL 实现使用 `Promise.all()` 并行执行多个查询:
-
-```typescript
-const [columnsResult, primaryKeysResult] = await Promise.all([
-    this.knex.raw(/* 列信息查询 */),
-    this.knex.raw(/* 主键查询 */),
-]);
-```
-
-### 2. SQLite 的 N+1 问题
-SQLite 由于缺乏 JOIN 支持，可能存在 N+1 问题:
-
-```typescript
-// 获取所有表的列信息需要逐个表查询
-const columnsPerTable = await Promise.all(
-    tables.map(async (table) => await this.columns(table))
-);
-```
-
-### 3. MSSQL 的临时表策略
-MSSQL 使用临时表优化复杂的索引信息查询:
-
-```typescript
-// 先将索引信息存入临时表
-await trx.raw(`SELECT ... INTO ##IndexInfo FROM [sys].[index_columns] ...`);
-
-// 然后在主查询中引用
-const query = trx.with('FilteredIndexInfo', this.knex.raw(`
-    SELECT ... FROM ##IndexInfo WHERE ...
-`));
-```
-
-## 总结
-
-Directus 的 Schema Introspection 机制通过以下设计优雅地处理了多数据库差异:
-
-1. **统一接口层**: `SchemaInspector` 定义了标准契约
-2. **方言实现层**: 每个数据库有独立的实现类处理特有语法
-3. **工厂选择层**: `createInspector()` 根据 Knex 客户端动态选择实现
-4. **可选属性模式**: 类型定义使用可选属性处理数据库特性差异
-
-这种设计使得:
-- **调用者**无需关心底层数据库类型
-- **扩展新数据库**只需实现 `SchemaInspector` 接口
-- **维护性**各数据库的差异逻辑隔离在各自的实现类中
+|--------|---------
