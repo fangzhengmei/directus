@@ -208,17 +208,459 @@ for (const field of Object.values(collection.fields)) {
 }
 ```
 
-### 4.3 REST API 动态路由
+### 4.3 REST API 动态路由：从路由入口到服务层的完整链路
 
-REST API 通过 `ItemsService` 动态处理所有集合的 CRUD 操作：
+#### 4.3.1 路由注册入口
+
+**文件位置**: `api/src/app.ts:342`
+
+```typescript
+app.use('/items', itemsRouter);
+```
+
+这行代码将 `itemsRouter` 注册到 Express 应用，使得所有 `/items/*` 路径的请求都由 items 控制器处理。
+
+#### 4.3.2 Schema 中间件：请求前的元数据加载
+
+在路由处理之前，`schema` 中间件会为每个请求加载 `SchemaOverview`：
+
+**文件位置**: `api/src/middleware/schema.ts:1-8`
+
+```typescript
+import type { RequestHandler } from 'express';
+import asyncHandler from '../utils/async-handler.js';
+import { getSchema } from '../utils/get-schema.js';
+
+const schema: RequestHandler = asyncHandler(async (req, _res, next) => {
+    req.schema = await getSchema();
+    return next();
+});
+
+export default schema;
+```
+
+**关键机制**：
+- `getSchema()` 会从缓存或数据库获取 `SchemaOverview`
+- 结果挂载到 `req.schema`，供后续所有中间件和控制器使用
+- 缓存由 `CACHE_SCHEMA` 环境变量控制
+
+**注册位置**: `api/src/app.ts:309`
+
+```typescript
+app.use(schema);
+```
+
+#### 4.3.3 Items 控制器：路由定义与 Schema 传递
+
+**文件位置**: `api/src/controllers/items.ts`
+
+控制器定义了所有 REST 端点，并在创建 `ItemsService` 时传入 `req.schema`：
+
+**路由定义汇总**:
+
+| HTTP 方法 | 路径 | 处理函数 | 功能 |
+|-----------|------|----------|------|
+| POST | `/items/:collection` | `createOne` / `createMany` | 创建单条或批量记录 |
+| GET | `/items/:collection` | `readHandler` | 查询列表（支持 `singleton`） |
+| GET | `/items/:collection/:pk` | `readOne` | 按主键查询单条 |
+| PATCH | `/items/:collection` | `updateBatch` / `updateMany` / `updateByQuery` | 批量更新 |
+| PATCH | `/items/:collection/:pk` | `updateOne` | 按主键更新单条 |
+| DELETE | `/items/:collection` | `deleteMany` / `deleteByQuery` | 批量删除 |
+| DELETE | `/items/:collection/:pk` | `deleteOne` | 按主键删除单条 |
+
+**关键代码示例 - 创建操作** (`api/src/controllers/items.ts:15-59`):
+
+```typescript
+router.post(
+    '/:collection',
+    collectionExists,
+    asyncHandler(async (req, res, next) => {
+        // 1. 检查是否为系统集合（系统集合不允许直接操作）
+        if (isSystemCollection(req.params['collection']!)) throw new ForbiddenError();
+
+        // 2. 单例集合不支持 POST 创建
+        if (req.singleton) {
+            throw new RouteNotFoundError({ path: req.path });
+        }
+
+        // 3. 创建 ItemsService，传入 req.schema！
+        const service = new ItemsService(req.collection, {
+            accountability: req.accountability,
+            schema: req.schema,  // 关键：SchemaOverview 被传递到服务层
+        });
+
+        // 4. 执行创建
+        if (Array.isArray(req.body)) {
+            const keys = await service.createMany(req.body);
+            savedKeys.push(...keys);
+        } else {
+            const key = await service.createOne(req.body);
+            savedKeys.push(key);
+        }
+
+        // 5. 读取并返回创建的数据
+        if (Array.isArray(req.body)) {
+            const result = await service.readMany(savedKeys, req.sanitizedQuery);
+            res.locals['payload'] = { data: result || null };
+        } else {
+            const result = await service.readOne(savedKeys[0]!, req.sanitizedQuery);
+            res.locals['payload'] = { data: result || null };
+        }
+
+        return next();
+    }),
+    respond,
+);
+```
+
+#### 4.3.4 ItemsService：Schema 在业务层的实际使用
 
 **文件位置**: `api/src/services/items.ts`
 
-`ItemsService` 使用 `SchemaOverview` 来：
-- 验证字段是否存在
-- 处理关系字段的特殊逻辑
-- 应用权限过滤
-- 处理文件上传、版本控制等特殊行为
+`ItemsService` 在构造函数中接收 `SchemaOverview`，并在所有 CRUD 操作中使用：
+
+**构造函数** (`api/src/services/items.ts:53-63`):
+
+```typescript
+constructor(collection: Collection, options: AbstractServiceOptions) {
+    this.collection = collection;
+    this.knex = options.knex || getDatabase();
+    this.accountability = options.accountability || null;
+    this.eventScope = isSystemCollection(this.collection) ? this.collection.substring(9) : 'items';
+    this.schema = options.schema;  // 保存 SchemaOverview
+    this.cache = getCache().cache;
+    this.nested = options.nested ?? [];
+
+    return this;
+}
+```
+
+**Schema 的实际使用场景**:
+
+1. **获取主键字段** (`api/src/services/items.ts:108`):
+   ```typescript
+   async getKeysByQuery(query: Query): Promise<PrimaryKey[]> {
+       const primaryKeyField = this.schema.collections[this.collection]!.primary;
+       // ...
+   }
+   ```
+
+2. **创建操作中的字段处理** (`api/src/services/items.ts:134-139`):
+   ```typescript
+   async createOne(data: Partial<Item>, opts: MutationOptions = {}): Promise<PrimaryKey> {
+       const primaryKeyField = this.schema.collections[this.collection]!.primary;
+       const fields = Object.keys(this.schema.collections[this.collection]!.fields);  // 获取所有字段名
+       
+       const aliases = Object.values(this.schema.collections[this.collection]!.fields)
+           .filter((field) => field.alias === true)
+           .map((field) => field.field);
+       // ...
+   }
+   ```
+
+3. **自增主键检测** (`api/src/services/items.ts:234-244`):
+   ```typescript
+   const pkField = this.schema.collections[this.collection]!.fields[primaryKeyField];
+   
+   if (
+       primaryKey &&
+       pkField &&
+       !opts.bypassAutoIncrementSequenceReset &&
+       ['integer', 'bigInteger'].includes(pkField.type) &&
+       pkField.defaultValue === 'AUTO_INCREMENT'
+   ) {
+       autoIncrementSequenceNeedsToBeReset = true;
+   }
+   ```
+
+#### 4.3.5 PayloadService：字段值的类型转换与特殊处理
+
+**文件位置**: `api/src/services/payload.ts`
+
+`PayloadService` 负责处理字段值的转换，依赖 `FieldOverview.special` 属性：
+
+**核心转换器定义** (`api/src/services/payload.ts:74-195`):
+
+```typescript
+public transformers: Transformers = {
+    async hash({ action, value }) {
+        // 创建/更新时对密码等字段进行哈希
+        if (action === 'create' || action === 'update') {
+            return await generateHash(String(value));
+        }
+        return value;
+    },
+    async uuid({ action, value }) {
+        // 创建时自动生成 UUID（如果未提供）
+        if (action === 'create' && !value) {
+            return randomUUID();
+        }
+        return value;
+    },
+    async 'user-created'({ action, value, accountability, overwriteDefaults }) {
+        // 创建时自动设置当前用户
+        if (action === 'create') return (overwriteDefaults ? overwriteDefaults._user : accountability?.user) ?? null;
+        return value;
+    },
+    async 'date-created'({ action, value, helpers, overwriteDefaults }) {
+        // 创建时自动设置当前时间
+        if (action === 'create')
+            return new Date(
+                overwriteDefaults ? overwriteDefaults._date : helpers.date.writeTimestamp(new Date().toISOString()),
+            );
+        return value;
+    },
+    // ... 更多转换器：user-updated, role-created, date-updated, cast-json, cast-boolean 等
+};
+```
+
+**处理入口** (`api/src/services/payload.ts:213-282`):
+
+```typescript
+async processValues(
+    action: PayloadAction,
+    payload: Partial<Item> | Partial<Item>[],
+    aliasMap: Record<string, string> = {},
+    aggregate: Aggregate = {},
+): Promise<Partial<Item> | Partial<Item>[]> {
+    const fieldEntries = Object.entries(this.schema.collections[this.collection]!.fields);
+    
+    // 筛选有 special 标记的字段
+    let specialFields: [string, FieldOverview][] = [];
+    for (const [name, field] of fieldEntries) {
+        if (field.special && field.special.length > 0) {
+            specialFields.push([name, field]);
+        }
+    }
+    
+    // 对每个记录应用转换器
+    for (const record of processedPayload) {
+        for (const [name, field] of specialFields) {
+            const newValue = await this.processField(field, record, action, this.accountability);
+            if (newValue !== undefined) record[name] = newValue;
+        }
+    }
+    // ...
+}
+```
+
+---
+
+## 4.4 可空字段与默认值的语义边界
+
+### 4.4.1 三个相关属性的定义与来源
+
+在 Directus 中，有三个属性共同控制字段的"必填"语义，但它们来自不同层级：
+
+| 属性 | 类型 | 来源 | 语义 |
+|------|------|------|------|
+| `FieldOverview.nullable` | `boolean` | 数据库列定义 `schema.is_nullable` | 数据库层面是否允许 NULL |
+| `FieldOverview.defaultValue` | `any` | 数据库列默认值 `schema.default_value` | 数据库层面的默认值 |
+| `FieldMeta.required` | `boolean` | `directus_fields.required` | Directus 层面的"必填"标记（主要用于 UI）|
+| `FieldOverview.generated` | `boolean` | 数据库列定义 | 是否为数据库生成的列（如计算列）|
+
+**SchemaOverview 构建时的赋值逻辑** (`api/src/utils/get-schema.ts:153-177`):
+
+```typescript
+result.collections[collection] = {
+    collection,
+    primary: info.primary,
+    singleton: toBoolean(collectionMeta?.singleton),
+    // ...
+    fields: mapValues(schemaOverview[collection]?.columns, (column) => {
+        return {
+            field: column.column_name,
+            defaultValue: getDefaultValue(column) ?? null,  // 来自数据库 schema
+            nullable: column.is_nullable ?? true,          // 来自数据库 schema
+            generated: column.is_generated ?? false,       // 来自数据库 schema
+            type: getLocalType(column),
+            dbType: column.data_type,
+            // ...
+        };
+    }),
+};
+```
+
+### 4.4.2 默认值的处理逻辑
+
+**文件位置**: `api/src/utils/get-default-value.ts`
+
+`getDefaultValue()` 函数负责将数据库原始默认值转换为正确的 JavaScript 类型：
+
+```typescript
+export default function getDefaultValue(
+    column: SchemaOverview[string]['columns'][string] | Column,
+    field?: { special?: FieldMeta['special'] },
+): string | boolean | number | Record<string, any> | any[] | null {
+    const type = getLocalType(column, field);
+
+    const defaultValue = column.default_value ?? null;
+    if (defaultValue === null) return null;
+    if (defaultValue === '0000-00-00 00:00:00') return null;  // MySQL 的"零日期"视为 null
+
+    switch (type) {
+        case 'bigInteger':
+        case 'integer':
+        case 'decimal':
+        case 'float':
+            return Number.isNaN(Number(defaultValue)) === false ? Number(defaultValue) : defaultValue;
+        case 'boolean':
+            return castToBoolean(defaultValue);  // 处理 '0'/'1', 'false'/'true' 等
+        case 'json':
+            return castToObject(defaultValue);  // 解析 JSON 字符串
+        default:
+            return defaultValue;
+    }
+}
+```
+
+**重要发现**：
+- 默认值 `'AUTO_INCREMENT'` 是一个特殊字符串，表示该字段由数据库自增生成
+- MySQL 的 `'0000-00-00 00:00:00'` 被视为 `null`
+
+### 4.4.3 字段可空性的判断逻辑
+
+**文件位置**: `api/src/permissions/modules/process-payload/lib/is-field-nullable.ts`
+
+这是 API 层面判断字段是否允许为 `null` 的核心函数：
+
+```typescript
+import { GENERATE_SPECIAL } from '@directus/constants';
+import type { FieldOverview } from '@directus/types';
+
+export function isFieldNullable(field: FieldOverview) {
+    // 1. 数据库层面允许 NULL → 可空
+    if (field.nullable) return true;
+    
+    // 2. 是数据库生成的列（如计算列）→ 可空（不由用户提供值）
+    if (field.generated) return true;
+
+    // 3. 有 "自动生成" 的 special 标记 → 可空（系统会自动填充）
+    const hasGenerateSpecial = GENERATE_SPECIAL.some((name) => field.special.includes(name));
+
+    return hasGenerateSpecial;
+}
+```
+
+**GENERATE_SPECIAL 包含的标记**（来自 `@directus/constants`）:
+- `uuid` - 自动生成 UUID
+- `user-created` - 自动设置创建者
+- `user-updated` - 自动设置更新者
+- `role-created` - 自动设置创建角色
+- `role-updated` - 自动设置更新角色
+- `date-created` - 自动设置创建时间
+- `date-updated` - 自动设置更新时间
+
+### 4.4.4 创建时的必填验证逻辑
+
+**文件位置**: `api/src/permissions/modules/process-payload/process-payload.ts`
+
+这是实际执行验证的核心代码，清晰地展示了语义边界：
+
+```typescript
+for (const field of fields) {
+    if (!isFieldNullable(field)) {
+        // 关键判断：创建时 + 无默认值 → 必须提交该字段
+        const isSubmissionRequired = options.action === 'create' && field.defaultValue === null;
+
+        if (isSubmissionRequired) {
+            fieldValidationRules.push({
+                [field.field]: {
+                    _submitted: true,  // 验证：字段必须存在于 payload 中
+                },
+            });
+        }
+
+        // 无论创建还是更新，值都不能为 null
+        fieldValidationRules.push({
+            [field.field]: {
+                _nnull: true,  // 验证：值不能为 null
+            },
+        });
+    }
+
+    // 额外：应用字段自定义的 validation 规则
+    if (field.validation) {
+        // ...
+        fieldValidationRules.push(validationFilter);
+    }
+}
+```
+
+### 4.4.5 语义边界总结表
+
+| 场景 | `nullable=true` | `nullable=false` + `defaultValue=AUTO_INCREMENT` | `nullable=false` + `defaultValue='foo'` | `nullable=false` + `defaultValue=null` |
+|------|-----------------|---------------------------------------------------|-------------------------------------------|------------------------------------------|
+| 创建时不提交字段 | ✅ 允许，存 NULL | ✅ 允许，数据库自增 | ✅ 允许，使用默认值 `'foo'` | ❌ 报错：`_submitted` 验证失败 |
+| 创建时提交 `null` | ✅ 允许 | ❌ 报错：`_nnull` 验证失败 | ❌ 报错：`_nnull` 验证失败 | ❌ 报错：`_nnull` 验证失败 |
+| 创建时提交有效值 | ✅ 允许 | ✅ 允许（会覆盖自增值）| ✅ 允许（会覆盖默认值）| ✅ 允许 |
+| 更新时设为 `null` | ✅ 允许 | ❌ 报错：`_nnull` 验证失败 | ❌ 报错：`_nnull` 验证失败 | ❌ 报错：`_nnull` 验证失败 |
+
+### 4.4.6 FieldMeta.required 的作用
+
+注意 `FieldMeta.required` 与上述验证逻辑**没有直接关系**！
+
+**`FieldMeta.required` 的实际用途**：
+
+1. **UI 层面**：表单中显示红色星号 `*`
+2. **OpenAPI/Spec 生成**：在动态生成的 OpenAPI schema 中标记为 `required`
+
+**代码位置**: `api/src/services/specifications.ts:414-427`
+
+```typescript
+// 在 generateComponents 中
+for (const field of fieldsInCollection) {
+    const fieldSchema = this.generateField(schema, collection.collection, field, tags);
+    schemaComponent.properties![field.field] = fieldSchema;
+
+    // Check if field is required
+    if (field.nullable === false && field.defaultValue === null && field.generated === false) {
+        requiredFields.push(field.field);
+    }
+}
+```
+
+**注意**：OpenAPI 的 `required` 判断使用的是 `FieldOverview` 的属性，而非 `FieldMeta.required`。
+
+---
+
+## 4.5 动态 OpenAPI 规范生成
+
+**文件位置**: `api/src/services/specifications.ts`
+
+`SpecificationService` 使用 `SchemaOverview` 动态生成 OpenAPI 3.0 规范：
+
+**路径生成** (`api/src/services/specifications.ts:173-347`):
+- 遍历 `schema.collections` 为每个集合生成 `/items/{collection}` 路径
+- 根据权限过滤可见的路径和方法
+
+**组件 Schema 生成** (`api/src/services/specifications.ts:349-434`):
+```typescript
+for (const field of fieldsInCollection) {
+    const fieldSchema = this.generateField(schema, collection.collection, field, tags);
+    schemaComponent.properties![field.field] = fieldSchema;
+
+    // 使用 FieldOverview 判断必填性
+    if (field.nullable === false && field.defaultValue === null && field.generated === false) {
+        requiredFields.push(field.field);
+    }
+}
+```
+
+**字段类型映射** (`api/src/services/specifications.ts:552-635`):
+```typescript
+private fieldTypes: Record<Type, Partial<SchemaObject>> = {
+    alias: { type: 'string' },
+    bigInteger: { type: 'integer', format: 'int64' },
+    boolean: { type: 'boolean' },
+    date: { type: 'string', format: 'date' },
+    dateTime: { type: 'string', format: 'date-time' },
+    float: { type: 'number', format: 'float' },
+    integer: { type: 'integer' },
+    uuid: { type: 'string', format: 'uuid' },
+    // ... 更多类型映射
+};
+```
 
 ---
 
