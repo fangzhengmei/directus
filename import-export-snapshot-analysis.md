@@ -70,47 +70,110 @@ if (limitReached) {
 
 **阶段 4: 文件解析与数据库写入**
 
+**关键事务语义**：整个导入过程在**单个数据库事务**中执行。
+
 **JSON 导入** (`import-export.ts:340-451`)：
 
 - 使用 `stream-json` 进行流式解析，避免大文件内存溢出
 - 使用 `async.queue` 进行并行处理
-- 事务保证原子性
-- 错误追踪机制
+- **整个导入在一个事务中**，任何错误都会导致完全回滚
+- 错误追踪机制用于收集和聚合错误信息，便于报告
 
 ```typescript
 async importJSON(collection: string, stream: Readable): Promise<void> {
     const extractJSON = StreamArray.withParser();
+    const nestedActionEvents: ActionEventParams[] = [];
     const errorTracker = createErrorTracker();
-    
+    const isSingleton = this.schema.collections[collection]?.singleton ?? false;
+    let timeout: NodeJS.Timeout;
+
+    // 整个导入在一个事务中执行
     return transaction(this.knex, async (trx) => {
-        const service = getService(collection, { knex: trx, ... });
-        
-        const saveQueue = queue(async (task: { data: Record<string, unknown>; rowNumber: number }) => {
-            if (errorTracker.shouldStop()) return;
-            try {
-                return await service.upsertOne(task.data, { ... });
-            } catch (error) {
-                errorTracker.addCapturedError(err, task.rowNumber);
+        const service = getService(collection, {
+            knex: trx,
+            schema: this.schema,
+            accountability: this.accountability,
+        });
+
+        try {
+            await new Promise<void>((resolve, reject) => {
+                let rowNumber = 1;
+
+                const saveQueue = queue(async (task: { data: Record<string, unknown>; rowNumber: number }) => {
+                    if (errorTracker.shouldStop()) return;
+
+                    try {
+                        if (isSingleton) {
+                            return await service.upsertSingleton(task.data, {
+                                bypassEmitAction: (params) => nestedActionEvents.push(params),
+                            });
+                        } else {
+                            return await service.upsertOne(task.data, {
+                                bypassEmitAction: (params) => nestedActionEvents.push(params),
+                            });
+                        }
+                    } catch (error) {
+                        // 收集错误信息
+                        for (const err of toArray(error)) {
+                            errorTracker.addCapturedError(err, task.rowNumber);
+
+                            if (errorTracker.shouldStop()) {
+                                break;
+                            }
+                        }
+
+                        // 达到错误限制或发生泛型错误时，拒绝 Promise
+                        if (errorTracker.shouldStop()) {
+                            saveQueue.kill();
+                            destroyPipedStream(extractJSON, stream);
+                            reject();  // 这会导致事务回滚
+                        }
+
+                        return;
+                    }
+                });
+
+                stream.pipe(extractJSON);
+
+                extractJSON.on('data', ({ value }: Record<string, any>) => {
+                    // ... 处理数据
+                    saveQueue.push({ data: value, rowNumber: rowNumber++ });
+                });
+
+                extractJSON.on('end', () => {
+                    saveQueue.drain(() => {
+                        // 如果有任何错误，拒绝 Promise → 事务回滚
+                        if (errorTracker.hasErrors()) {
+                            return reject();  // 事务回滚
+                        }
+
+                        // 只有完全没有错误时才提交事务
+                        for (const nestedActionEvent of nestedActionEvents) {
+                            emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+                        }
+
+                        return resolve();  // 事务提交
+                    });
+                });
                 // ...
+            });
+        } catch (error) {
+            if (!error && errorTracker.hasErrors()) {
+                // 构建详细的错误信息返回给用户
+                throw errorTracker.buildFinalErrors();
             }
-        });
-        
-        stream.pipe(extractJSON);
-        
-        extractJSON.on('data', ({ value }) => {
-            saveQueue.push({ data: value, rowNumber: rowNumber++ });
-        });
-        // ...
+
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
     });
 }
 ```
 
 **CSV 导入** (`import-export.ts:453-635`)：
 
-- 先写入临时文件，再解析
-- 使用 `papaparse` 解析 CSV
-- 支持嵌套字段（通过 `lodash.set`）
-- 与 JSON 导入共享相同的队列和错误追踪机制
+与 JSON 导入共享相同的事务语义和错误处理机制。
 
 **阶段 5: 后台处理与通知** (`import-export.ts:290-337`)
 
@@ -121,7 +184,12 @@ if (options?.background) {
             await notify('Your import has been successful', `Your import in ${collection} has been successful.`);
         })
         .catch(async (error) => {
-            await notify('Your import has failed', `Your import in ${collection} has failed...`);
+            logger.error(error, `Background import to ${collection} failed`);
+
+            await notify(
+                'Your import has failed',
+                `Your import in ${collection} has failed.\n\n${(error as any).message ?? ''}`,
+            );
         })
         .finally(async () => await decrementImportCount());
 }
@@ -134,7 +202,7 @@ if (options?.background) {
 ```
 HTTP Request → 权限校验(隐式) → 分批查询 → 格式转换 → 临时文件 → 上传文件 → 通知用户
                                     ↓
-                              后台异步执行
+                              后台异步执行 (始终)
 ```
 
 #### 1.3.2 详细流程分析
@@ -149,13 +217,32 @@ HTTP Request → 权限校验(隐式) → 分批查询 → 格式转换 → 临�
 const batchesRequired = Math.ceil(count / (env['EXPORT_BATCH_SIZE'] as number));
 
 for (let batch = 0; batch < batchesRequired; batch++) {
+    let limit = env['EXPORT_BATCH_SIZE'] as number;
+
+    if (requestedLimit > 0 && (env['EXPORT_BATCH_SIZE'] as number) > requestedLimit - readCount) {
+        limit = requestedLimit - readCount;
+    }
+
     const result = await service.readByQuery({
         ...query,
+        sort,
         limit,
         offset: batch * (env['EXPORT_BATCH_SIZE'] as number),
     });
-    // 写入临时文件
-    await appendFile(tmpFile.path, this.transform(result, format, { ... }));
+
+    readCount += result.length;
+
+    if (result.length) {
+        // 写入临时文件
+        await appendFile(
+            tmpFile.path,
+            this.transform(result, format, {
+                includeHeader: batch === 0,
+                includeFooter: batch + 1 === batchesRequired,
+                fields: csvHeadings,
+            }),
+        );
+    }
 }
 ```
 
@@ -163,37 +250,55 @@ for (let batch = 0; batch < batchesRequired; batch++) {
 
 支持的格式：`csv`, `csv_utf8`, `json`, `xml`, `yaml`
 
-```typescript
-transform(input: Record<string, any>[], format: ExportFormat, options?: {...}): string {
-    if (format === 'json') { ... }
-    if (format === 'xml') { ... }
-    if (format.startsWith('csv')) { ... }
-    if (format === 'yaml') { ... }
-}
-```
-
 **阶段 4: 文件上传与通知** (`import-export.ts:760-824`)
 
 ```typescript
 // 上传到文件服务
 const savedFile = await filesService.uploadOne(createReadStream(tmpFile.path), fileWithDefaults);
 
-// 发送通知
-await notificationsService.createOne({
-    recipient: this.accountability.user,
-    subject: `Your export of ${collection} is ready`,
-    message: `Your export of ${collection} is ready. <a href="${href}">Click here to view.</a>`,
-});
+// 发送通知（只有当有用户上下文时）
+if (this.accountability?.user) {
+    const notificationsService = new NotificationsService({
+        schema: this.schema,
+    });
+
+    const usersService = new UsersService({
+        schema: this.schema,
+    });
+
+    const user = await usersService.readOne(this.accountability.user, {
+        fields: ['first_name', 'last_name', 'email'],
+    });
+
+    const href = new Url(env['PUBLIC_URL'] as string).addPath('admin', 'files', savedFile).toString();
+
+    const message = `
+Hello ${userName(user)},
+
+Your export of ${collection} is ready. <a href="${href}">Click here to view.</a>
+`;
+
+    await notificationsService.createOne({
+        recipient: this.accountability.user,
+        sender: this.accountability.user,
+        subject: `Your export of ${collection} is ready`,
+        message,
+        collection: `directus_files`,
+        item: savedFile,
+    });
+}
 ```
 
 ### 1.4 错误追踪机制
 
-`createErrorTracker` (`import-export.ts:64-201`) 提供了完善的错误追踪：
+`createErrorTracker` (`import-export.ts:64-201`) 的作用：
+
+> **重要**：错误追踪的目的是**收集和聚合错误信息以便更好地报告给用户**，而不是支持部分成功。整个导入在一个事务中执行，任何错误都会导致完全回滚。
 
 - **字段级错误聚合**：相同字段的错误会聚合在一起
 - **行号范围优化**：连续行号会显示为范围（如 `1-5` 而不是 `1,2,3,4,5`）
-- **错误限制**：`MAX_IMPORT_ERRORS` 环境变量控制最大错误数
-- **泛型错误**：非字段相关的错误单独处理
+- **错误限制**：`MAX_IMPORT_ERRORS` 环境变量控制何时停止收集错误并回滚
+- **泛型错误**：非字段相关的错误会立即导致回滚
 
 ---
 
@@ -396,208 +501,206 @@ async apply(payload: SnapshotDiffWithHash, options?: {...}): Promise<void> {
 
 ---
 
-## 3. 协作机制详解
+## 3. 执行状态与进度反馈机制
 
-### 3.1 数据导入的协作流程
+### 3.1 数据导入的状态反馈
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           HTTP Request (POST /utils/import/:collection)     │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 1. 权限校验 (validateAccess)                                                 │
-│    - 系统集合: 检查 admin 权限                                               │
-│    - 普通集合: 检查 create + update 权限                                     │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 2. 并发控制 (useStore)                                                        │
-│    - 读取 importCount                                                         │
-│    - 检查是否超过 IMPORT_MAX_CONCURRENCY                                     │
-│    - 原子性递增 importCount                                                   │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 3. 文件解析 (流式)                                                             │
-│    JSON: stream-json → 逐行解析 → push 到队列                                │
-│    CSV: 临时文件 → papaparse → 逐行解析 → push 到队列                        │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 4. 数据库写入 (async.queue + 事务)                                            │
-│    - 队列并行处理 (默认并发数由 async.queue 控制)                             │
-│    - 每个任务调用 service.upsertOne                                           │
-│    - 错误追踪: addCapturedError                                               │
-│    - 达到 MAX_IMPORT_ERRORS 或泛型错误时停止                                  │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │                           │
-                    ▼                           ▼
-        ┌─────────────────────┐     ┌─────────────────────┐
-        │  background=false   │     │  background=true    │
-        │  (同步等待)         │     │  (后台执行)         │
-        └──────────┬──────────┘     └──────────┬──────────┘
-                   │                             │
-                   ▼                             ▼
-        ┌─────────────────────┐     ┌─────────────────────┐
-        │ 5. 等待完成         │     │ 5. 立即返回 200     │
-        │    成功/抛出错误    │     │    后台继续执行      │
-        └──────────┬──────────┘     └──────────┬──────────┘
-                   │                             │
-                   ▼                             ▼
-        ┌─────────────────────────────────────────────────┐
-        │ 6. 资源清理与通知                                │
-        │    - decrementImportCount                       │
-        │    - 成功: 通知成功消息                          │
-        │    - 失败: 通知错误消息                          │
-        └─────────────────────────────────────────────────┘
+#### 3.1.1 同步模式 (`background=false`，默认)
+
+**执行方式**：HTTP 请求同步等待导入完成
+
+**状态反馈**：
+
+| 阶段 | 反馈方式 | 说明 |
+|------|----------|------|
+| 进行中 | HTTP 连接保持 | 客户端处于等待状态 |
+| 成功 | HTTP 200 OK | 响应体为空 |
+| 失败 | HTTP 错误响应 | 包含详细错误信息（字段、行号等） |
+
+**错误响应示例**：
+
+```json
+{
+  "errors": [
+    {
+      "message": "Field \"title\" is required",
+      "extensions": {
+        "code": "FAILED_VALIDATION",
+        "field": "title",
+        "type": "any.required",
+        "rows": [
+          { "type": "range", "start": 1, "end": 5 },
+          { "type": "lines", "rows": [7, 9, 12] }
+        ]
+      }
+    }
+  ]
+}
 ```
 
-### 3.2 数据导出的协作流程
+#### 3.1.2 后台模式 (`background=true`)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        HTTP Request (POST /utils/export/:collection)        │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 1. 参数校验                                                                   │
-│    - 检查 query 和 format 必填                                                │
-│    - sanitizeQuery 清理查询参数                                               │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 2. 启动后台任务 (不 await)                                                    │
-│    service.exportToFile(...)  // 没有 await，立即返回                        │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 3. HTTP 响应 (立即返回)                                                       │
-│    return next();  // 响应 204 No Content                                    │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                    (后台继续执行)
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 4. 分批查询 (EXPORT_BATCH_SIZE)                                               │
-│    - 先查询总数                                                                │
-│    - 循环分批读取                                                              │
-│    - 每次读取后写入临时文件                                                    │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 5. 格式转换                                                                    │
-│    - JSON: JSON.stringify with header/footer control                         │
-│    - CSV: json2csv with flatten transform                                    │
-│    - XML: js2xmlparser                                                        │
-│    - YAML: js-yaml                                                            │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 6. 文件上传与通知                                                             │
-│    - 临时文件 → FilesService.uploadOne                                        │
-│    - 通知用户: "Your export of {collection} is ready"                        │
-│    - 清理临时文件                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+**执行方式**：HTTP 立即返回，导入在后台异步执行
+
+**状态反馈**：
+
+| 阶段 | 反馈方式 | 说明 |
+|------|----------|------|
+| 请求接收 | HTTP 200 OK | 立即返回，导入开始 |
+| 进行中 | 无主动反馈 | 客户端需要轮询或等待通知 |
+| 成功 | 站内通知 | `NotificationsService` 发送 "Your import has been successful" |
+| 失败 | 站内通知 | `NotificationsService` 发送 "Your import has failed"，包含错误信息 |
+
+**重要限制**：
+- 后台模式没有进度条或百分比反馈
+- 只能通过最终的成功/失败通知了解结果
+- 并发状态通过 `importCount` 追踪，但不对外暴露
+
+### 3.2 数据导出的状态反馈
+
+#### 3.2.1 执行方式
+
+**始终是后台异步执行**（控制器中没有 `await`）：
+
+```typescript
+// controllers/utils.ts:173-176
+// We're not awaiting this, as it's supposed to run async in the background
+service.exportToFile(req.params['collection']!, sanitizedQuery, req.body.format, {
+    file: req.body.file,
+});
+
+return next();  // 立即返回
 ```
 
-### 3.3 Schema Snapshot 的协作流程
+#### 3.2.2 状态反馈
 
-**创建快照：**
+| 阶段 | 反馈方式 | 说明 |
+|------|----------|------|
+| 请求接收 | HTTP 204 No Content | 立即返回，导出开始 |
+| 进行中 | 无主动反馈 | 客户端需要等待通知 |
+| 成功 | 站内通知 + 文件记录 | 通知包含下载链接，文件保存到 `directus_files` |
+| 失败 | 站内通知 | 通知 "Your export of {collection} failed" |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  GET /schema/snapshot 或 CLI: directus schema snapshot          │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. 权限校验: admin only                                           │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 2. 并行读取元数据                                                 │
-│    - CollectionsService.readByQuery()                            │
-│    - FieldsService.readAll()                                     │
-│    - RelationsService.readAll()                                  │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 3. 过滤与规范化                                                   │
-│    - 排除系统表 (meta.system === true)                           │
-│    - 排除未跟踪表 (meta === null)                                │
-│    - 排序确保一致性                                               │
-│    - 移除 id (omitID)                                            │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 4. 输出                                                           │
-│    API: JSON 响应                                                 │
-│    CLI: 文件输出 (JSON/YAML) 或 stdout                           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**应用快照：**
+**成功通知示例**：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  POST /schema/apply 或 CLI: directus schema apply <file>       │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. 解析文件 (JSON/YAML)                                          │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 2. 获取当前快照 (getSnapshot)                                     │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 3. 计算差异 (getSnapshotDiff)                                     │
-│    - 比较 collections/fields/relations/systemFields              │
-│    - 生成 SnapshotDiff                                            │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 4. 交互式确认 (CLI only, --yes 跳过)                             │
-│    - 显示将执行的变更: Create/Update/Delete                      │
-│    - 询问是否继续                                                 │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 5. 事务应用 (applyDiff)                                           │
-│    1. 创建集合 (递归处理嵌套)                                      │
-│    2. 删除集合 (先清理关系)                                        │
-│    3. 更新集合                                                    │
-│    4. 处理字段                                                    │
-│    5. 处理系统字段                                                │
-│    6. 处理关系                                                    │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 6. 缓存刷新 (flushCaches)                                         │
-└─────────────────────────────────────────────────────────────────┘
+Hello {User Name},
+
+Your export of articles is ready. <a href="/admin/files/{file_id}">Click here to view.</a>
+```
+
+### 3.3 Schema Snapshot 的状态反馈
+
+#### 3.3.1 HTTP API 方式
+
+**执行方式**：同步执行，HTTP 请求等待完成
+
+| 操作 | 端点 | 成功响应 | 失败响应 |
+|------|------|----------|----------|
+| 创建快照 | `GET /schema/snapshot` | HTTP 200 + JSON 快照 | HTTP 错误响应 |
+| 计算差异 | `POST /schema/diff` | HTTP 200 + diff JSON | HTTP 错误响应 |
+| 应用差异 | `POST /schema/apply` | HTTP 204 No Content | HTTP 错误响应 |
+
+**特点**：
+- 没有后台执行选项
+- 没有通知机制
+- 客户端同步等待结果
+
+#### 3.3.2 CLI 方式
+
+**执行方式**：同步执行，输出到控制台
+
+| 操作 | 命令 | 状态反馈 |
+|------|------|----------|
+| 创建快照 | `directus schema snapshot` | 输出到 stdout 或保存到文件 |
+| 应用快照 | `directus schema apply <file>` | 控制台显示变更列表，交互式确认，执行日志 |
+
+**CLI 应用快照的输出示例**：
+
+```
+The following changes will be applied:
+
+Collections:
+  - Create articles
+  - Update categories
+
+Fields:
+  - Create articles.title
+  - Update articles.status
+
+Relations:
+  - Create articles.category → categories
+
+? Would you like to continue? (Y/n)
+```
+
+**特点**：
+- 支持 `--dry-run` 预览变更
+- 支持 `--yes` 跳过交互式确认
+- 详细的控制台日志输出
+- 没有通知机制
+
+### 3.4 状态反馈机制对比表
+
+| 特性 | 数据导入 (同步) | 数据导入 (后台) | 数据导出 | Schema Snapshot (API) | Schema Snapshot (CLI) |
+|------|-----------------|-----------------|----------|------------------------|------------------------|
+| **执行模式** | 同步 | 异步 | 异步 | 同步 | 同步 |
+| **HTTP 响应时机** | 完成后 | 立即 | 立即 | 完成后 | N/A |
+| **进度反馈** | 无 (等待) | 无 | 无 | 无 (等待) | 有 (控制台) |
+| **成功通知** | 无 (HTTP 200) | 站内通知 | 站内通知 | 无 (HTTP 204) | 控制台日志 |
+| **失败通知** | HTTP 错误响应 | 站内通知 | 站内通知 | HTTP 错误响应 | 控制台错误 |
+| **详细错误信息** | 有 (响应体) | 有 (通知) | 无 (仅提示失败) | 有 (响应体) | 有 (控制台) |
+| **预览/ dry-run** | 无 | 无 | 无 | 无 | 有 (`--dry-run`) |
+
+### 3.5 通知机制详解
+
+**通知服务** (`NotificationsService`) 用于后台操作的状态反馈：
+
+**适用场景**：
+- 数据导入 (`background=true`)
+- 数据导出 (始终后台)
+
+**不适用场景**：
+- Schema Snapshot (无通知)
+- 同步模式的导入导出
+
+**通知内容**：
+
+| 操作 | 成功主题 | 失败主题 |
+|------|----------|----------|
+| 导入 | "Your import has been successful" | "Your import has failed" |
+| 导出 | "Your export of {collection} is ready" | "Your export of {collection} failed" |
+
+**技术实现**：
+
+```typescript
+// services/import-export.ts:291-316
+const notify = async (subject: string, message: string) => {
+    try {
+        if (!this.accountability?.user) return;
+
+        const notificationsService = new NotificationsService({
+            schema: this.schema,
+        });
+
+        const usersService = new UsersService({
+            schema: this.schema,
+        });
+
+        const user = await usersService.readOne(this.accountability.user, {
+            fields: ['first_name', 'last_name', 'email'],
+        });
+
+        await notificationsService.createOne({
+            recipient: this.accountability.user,
+            sender: this.accountability.user,
+            subject,
+            message: `Hello ${userName(user)},\n\n${message}\n`,
+        });
+    } catch (error) {
+        logger.error(error, `Failed to notify user`);
+    }
+};
 ```
 
 ---
@@ -611,11 +714,13 @@ async apply(payload: SnapshotDiffWithHash, options?: {...}): Promise<void> {
 | **操作对象** | 数据行 (items/records) | 元数据 (schema) |
 | **数据内容** | 业务数据 | 表结构、字段定义、关系配置 |
 | **权限要求** | create/update 权限 (细粒度) | admin 权限 (粗粒度) |
-| **执行方式** | 支持后台异步 | 同步执行 |
+| **执行方式** | 导入: 同步/后台可选; 导出: 始终后台 | 始终同步 |
 | **并发控制** | 有 (IMPORT_MAX_CONCURRENCY) | 无 (依赖数据库锁) |
 | **事务边界** | 单次导入一个事务 | 整个 apply 一个事务 |
-| **错误处理** | 可容忍部分错误 (MAX_IMPORT_ERRORS) | 全有或全无 |
-| **通知机制** | 有 (成功/失败通知) | CLI 有日志，API 无通知 |
+| **回滚语义** | 全有或全无 (任何错误都回滚) | 全有或全无 |
+| **错误追踪** | 有 (用于报告，非部分成功) | 无详细错误聚合 |
+| **通知机制** | 有 (后台模式) | 无 |
+| **进度反馈** | 无 (仅最终状态) | CLI 有控制台输出 |
 | **使用场景** | 数据迁移、批量更新、备份恢复 | 环境同步、版本控制、CI/CD |
 
 ### 4.2 边界图示
@@ -650,14 +755,14 @@ async apply(payload: SnapshotDiffWithHash, options?: {...}): Promise<void> {
 
 ### 4.3 典型使用场景
 
-**Data Import/Export 使用场景：**
+**Data Import/Export 使用场景**：
 
 1. **数据迁移**：从 CSV/JSON 导入产品目录
 2. **批量更新**：导出数据 → 外部编辑 → 重新导入
 3. **数据备份**：定期导出关键业务数据
 4. **数据集成**：与外部系统交换数据
 
-**Schema Snapshot 使用场景：**
+**Schema Snapshot 使用场景**：
 
 1. **环境同步**：开发 → 测试 → 生产 的 schema 迁移
 2. **版本控制**：将 schema 纳入 Git 管理
@@ -667,7 +772,7 @@ async apply(payload: SnapshotDiffWithHash, options?: {...}): Promise<void> {
 
 ### 4.4 权限模型差异
 
-**Import/Export 权限：**
+**Import/Export 权限**：
 
 ```
 权限检查点:
@@ -680,7 +785,7 @@ async apply(payload: SnapshotDiffWithHash, options?: {...}): Promise<void> {
 - 基于角色的细粒度控制
 ```
 
-**Schema Snapshot 权限：**
+**Schema Snapshot 权限**：
 
 ```
 权限检查点:
@@ -692,56 +797,72 @@ async apply(payload: SnapshotDiffWithHash, options?: {...}): Promise<void> {
 - DevOps 自动化流程
 ```
 
-### 4.5 错误处理策略差异
+### 4.5 事务与回滚语义对比
 
-**Import 错误处理：**
-
-```typescript
-// 设计目标: 尽可能导入更多数据，记录问题
-const errorTracker = createErrorTracker();
-
-// 1. 字段级错误聚合
-// 相同字段的错误会被分组，显示行号范围
-
-// 2. 可配置的错误容忍度
-// MAX_IMPORT_ERRORS 控制何时停止
-
-// 3. 两种错误类型
-// - 字段错误: 可继续导入其他行
-// - 泛型错误: 立即停止
-
-// 结果:
-// - 部分成功: 导入有效行，报告错误行
-// - 完全失败: 事务回滚
-```
-
-**Snapshot Apply 错误处理：**
+**Import 事务语义**：
 
 ```typescript
-// 设计目标: 全有或全无，保证 schema 一致性
-await transaction(database, async (trx) => {
-    // 任何一步失败都会回滚整个事务
-    await createCollections(...);
-    await deleteCollections(...);
-    // ...
+// 关键代码: import-export.ts:347-450
+return transaction(this.knex, async (trx) => {
+    // ... 所有写入操作
+    
+    // 队列处理完成后检查
+    saveQueue.drain(() => {
+        // 有任何错误 → reject → 事务回滚
+        if (errorTracker.hasErrors()) {
+            return reject();  // 事务回滚
+        }
+        
+        // 完全没有错误 → resolve → 事务提交
+        return resolve();  // 事务提交
+    });
 });
-
-// 结果:
-// - 成功: 所有变更应用
-// - 失败: 完全回滚到原始状态
 ```
+
+**关键点**：
+- 整个导入在**一个数据库事务**中执行
+- `errorTracker.hasErrors()` 检测到任何错误 → **事务回滚**
+- 只有当**完全没有错误**时才提交事务
+- `errorTracker` 的作用是**收集错误信息用于报告**，不是支持部分成功
+
+**Snapshot Apply 事务语义**：
+
+```typescript
+// apply-diff.ts:56-356
+await transaction(database, async (trx) => {
+    // 1. 创建集合
+    await createCollections(...);
+    
+    // 2. 删除集合
+    await deleteCollections(...);
+    
+    // 3. 更新集合
+    // 4. 处理字段
+    // 5. 处理系统字段
+    // 6. 处理关系
+    
+    // 任何一步抛出异常 → 事务回滚
+});
+```
+
+**关键点**：
+- 整个 apply 在**一个数据库事务**中执行
+- 任何操作失败 → **完全回滚**
+- 没有错误收集机制，失败即停止
 
 ### 4.6 何时使用哪个？
 
 | 需求 | 推荐方案 | 原因 |
 |------|----------|------|
-| 迁移 1000 条产品数据 | Import | 操作数据行，支持部分成功 |
+| 迁移 1000 条产品数据 | Import | 操作数据行，事务保证一致性 |
 | 复制开发环境的表结构到生产 | Snapshot | 操作元数据，保证结构一致 |
-| 导出用户报表数据 | Export | 数据导出，支持多种格式 |
+| 导出用户报表数据 | Export | 数据导出，支持多种格式，后台通知 |
 | 在 Git 中追踪数据库结构变更 | Snapshot | 快照可版本化，支持 diff |
-| 批量更新库存数量 | Import | 支持 upsert，增量更新 |
-| 自动化部署新功能的表结构 | Snapshot | CI/CD 友好，支持 dry-run |
+| 批量更新库存数量 | Import | 支持 upsert，事务保证 |
+| 自动化部署新功能的表结构 | Snapshot | CI/CD 友好，CLI 支持 dry-run |
 | 备份整个系统（结构+数据） | Snapshot + Export | 两者结合，完整备份 |
+| 需要预览变更再确认 | Snapshot (CLI) | 支持 `--dry-run` |
+| 需要后台执行不阻塞用户 | Import (background) / Export | 支持通知机制 |
 
 ---
 
@@ -760,6 +881,7 @@ await transaction(database, async (trx) => {
 | HTTP 端点 | `api/src/controllers/utils.ts` | 110-181 |
 | 错误追踪 | `api/src/services/import-export.ts` | 64-201 |
 | 并发控制 | `api/src/utils/store.ts` | 全部 |
+| 通知服务 | `api/src/services/notifications.ts` | 需查看 |
 
 ### 5.2 Schema Snapshot
 
@@ -787,7 +909,7 @@ await transaction(database, async (trx) => {
 | `IMPORT_TIMEOUT` | string | `'1h'` | 导入超时时间 |
 | `IMPORT_EXPORT_NAMESPACE` | string | ？ | Redis 命名空间 |
 | `EXPORT_BATCH_SIZE` | number | ？ | 导出分批大小 |
-| `MAX_IMPORT_ERRORS` | number | ？ | 最大容忍错误数 |
+| `MAX_IMPORT_ERRORS` | number | ？ | 收集错误数达到此值时停止并回滚 |
 
 ### 6.2 Schema Snapshot 相关
 
@@ -799,19 +921,57 @@ await transaction(database, async (trx) => {
 
 ### 7.1 核心设计理念
 
-1. **Import/Export**: 面向数据，灵活容错
+1. **Import/Export**: 面向数据，事务一致
    - 流式处理大文件
-   - 部分成功模式
+   - **全有或全无事务**（任何错误都回滚）
    - 细粒度权限控制
-   - 后台异步执行
+   - 后台异步执行 + 通知机制
+   - 错误追踪用于报告，非部分成功
 
 2. **Schema Snapshot**: 面向结构，一致性优先
    - 全有或全无事务
    - admin 权限保护
    - diff-based 增量更新
    - 版本控制友好
+   - CLI 支持 dry-run 预览
 
-### 7.2 协作模式总结
+### 7.2 事务与回滚语义总结
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        导入事务语义 (关键修正)                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   之前错误理解: "部分成功模式"                                                │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  行 1 ✅ 成功  │ 行 2 ❌ 失败  │ 行 3 ✅ 成功  │ 行 4 ❌ 失败      │   │
+│   │  结果: 行 1, 3 保留，报告行 2, 4 错误                              │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   实际正确语义: "全有或全无"                                                  │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  行 1 ✅ 成功  │ 行 2 ❌ 失败  │ 行 3 ✅ 成功  │ 行 4 ❌ 失败      │   │
+│   │  结果: 全部回滚，报告所有错误                                        │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   关键代码:                                                                   │
+│   saveQueue.drain(() => {                                                    │
+│       if (errorTracker.hasErrors()) {                                        │
+│           return reject();  // ← 任何错误都导致事务回滚                      │
+│       }                                                                       │
+│       return resolve();  // ← 只有完全无错误才提交                           │
+│   });                                                                         │
+│                                                                              │
+│   errorTracker 的作用:                                                        │
+│   - 收集和聚合错误信息                                                        │
+│   - 优化行号显示 (范围: 1-5, 离散: 7,9,12)                                  │
+│   - 用于构建友好的错误响应                                                    │
+│   - ❌ 不支持部分成功                                                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.3 协作模式总结
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -833,10 +993,17 @@ await transaction(database, async (trx) => {
 │              ▼                                                                 │
 │   ┌─────────────────────────────────────────────────────┐                  │
 │   │              数据库事务 (Transaction)                 │                  │
-│   │  ┌─────────┐  ┌─────────┐  ┌─────────┐             │                  │
-│   │  │ upsert  │  │ 错误    │  │ 事件    │             │                  │
-│   │  │ One     │  │ 追踪    │  │ 缓存    │             │                  │
-│   │  └─────────┘  └─────────┘  └─────────┘             │                  │
+│   │  ┌─────────────────────────────────────────────┐     │                  │
+│   │  │  关键: 全有或全无                             │     │                  │
+│   │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐    │     │                  │
+│   │  │  │ upsert  │  │ 错误    │  │ 事件    │    │     │                  │
+│   │  │  │ One     │  │ 追踪    │  │ 缓存    │    │     │                  │
+│   │  │  └─────────┘  └────┬────┘  └─────────┘    │     │                  │
+│   │  │                      │                       │     │                  │
+│   │  │  有错误? ──Yes──▶ 回滚                     │     │                  │
+│   │  │                      │                       │     │                  │
+│   │  │              No ──▶ 提交                    │     │                  │
+│   │  └─────────────────────────────────────────────┘     │                  │
 │   └─────────────────────────────────────────────────────┘                  │
 │                                                         │                    │
 │              ┌────────────────────────────────────────┘                    │
@@ -887,6 +1054,8 @@ await transaction(database, async (trx) => {
 │   │ API)    │                              │  按顺序执行:         │        │
 │   └──────────┘                              │  创建→删除→更新     │        │
 │                                             │  字段→系统字段→关系  │        │
+│                                             │                      │        │
+│                                             │  任何失败 → 完全回滚 │        │
 │                                             └──────────┬───────────┘        │
 │                                                        │                      │
 │                                                        ▼                      │
@@ -899,15 +1068,68 @@ await transaction(database, async (trx) => {
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.3 边界清晰划分
+### 7.4 状态反馈机制总结
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           执行状态反馈机制                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        数据导入 (同步模式)                             │   │
+│  │  HTTP Request ──▶ 等待 ──▶ 完成/失败                                  │   │
+│  │                                      │                                  │   │
+│  │                    ┌─────────────────┴─────────────────┐             │   │
+│  │                    ▼                                   ▼             │   │
+│  │              HTTP 200 OK                    HTTP 错误响应              │   │
+│  │              (空响应体)                    (详细错误信息)               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                      数据导入 (后台模式) / 数据导出                    │   │
+│  │  HTTP Request ──▶ 立即返回 200/204 ──▶ 后台执行                     │   │
+│  │                                                         │              │   │
+│  │                                    ┌────────────────────┴────────────┐ │   │
+│  │                                    ▼                                 ▼ │ │   │
+│  │                           站内通知 (成功)                   站内通知 (失败)│ │   │
+│  │                           "导入成功"                          "导入失败" │ │   │
+│  │                           "导出就绪 + 链接"                    "导出失败" │ │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        Schema Snapshot (HTTP API)                     │   │
+│  │  HTTP Request ──▶ 等待 ──▶ 完成/失败                                  │   │
+│  │                                      │                                  │   │
+│  │                    ┌─────────────────┴─────────────────┐             │   │
+│  │                    ▼                                   ▼             │   │
+│  │              HTTP 200/204                    HTTP 错误响应              │   │
+│  │              (快照JSON / 空)                  (错误信息)                │   │
+│  │                                                                  │   │
+│  │  ❌ 无后台模式  ❌ 无通知机制                                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        Schema Snapshot (CLI)                          │   │
+│  │  命令执行 ──▶ 控制台输出 ──▶ 变更列表 ──▶ 交互式确认 ──▶ 执行        │   │
+│  │                                                                         │   │
+│  │  ✅ 支持 --dry-run 预览                                                │   │
+│  │  ✅ 详细控制台日志                                                      │   │
+│  │  ❌ 无通知机制                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.5 边界清晰划分
 
 | 维度 | 数据导入导出 | Schema Snapshot |
 |------|-------------|-----------------|
 | **是什么** | 数据行的批量操作 | 元数据结构的版本管理 |
 | **为什么** | 业务数据的迁移、备份、集成 | 环境同步、版本控制、自动化部署 |
-| **怎么做** | 流式解析 + 队列处理 + 事务 + 部分成功 | 快照对比 + diff 计算 + 全有或全无事务 |
+| **怎么做** | 流式解析 + 队列处理 + **全有或全无事务** + 错误报告 | 快照对比 + diff 计算 + 全有或全无事务 |
 | **谁来做** | 业务用户 (基于角色权限) | 系统管理员 / DevOps |
+| **状态反馈** | HTTP 响应 + 站内通知 (后台) | HTTP 响应 + CLI 控制台输出 |
 
 这种清晰的边界划分使得 Directus 能够同时满足：
-- **业务用户**：灵活、容错的数据操作需求
+- **业务用户**：灵活、可靠的数据操作需求（事务保证）
 - **技术团队**：可靠、可追溯的 schema 管理需求
