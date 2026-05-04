@@ -1117,9 +1117,545 @@ emitter.onAction('extensions.reload', ({ added, removed }) => {
 
 ---
 
-## 7. 关键代码位置
+## 7. 扩展配置完整链路
 
-### 7.1 后端核心文件
+本章详细分析扩展配置从发现、展示、修改、持久化到重载生效的完整链路，包括启用/禁用切换和参数变更的处理流程。
+
+### 7.1 数据库存储模型
+
+扩展配置存储在 `directus_extensions` 表中，包含以下关键字段：
+
+```typescript
+// 数据库表结构（迁移定义）
+{
+  name: 'directus_extensions',
+  columns: {
+    id: {
+      type: 'string',
+      length: 64,
+      primaryKey: true,
+      nullable: false,
+    },
+    bundle: {
+      type: 'string',
+      length: 64,
+      nullable: true,
+      references: {
+        table: 'directus_extensions',
+        column: 'id',
+        onDelete: 'CASCADE',
+      },
+    },
+    enabled: {
+      type: 'boolean',
+      nullable: false,
+      default: true,
+    },
+    settings: {
+      type: 'text',
+      nullable: true,
+    },
+    meta: {
+      type: 'text',
+      nullable: true,
+    },
+  },
+}
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | string | 扩展唯一标识（通常是 npm 包名或文件夹名） |
+| `bundle` | string | Bundle 扩展的子扩展关联 ID |
+| `enabled` | boolean | 是否启用（默认为 true） |
+| `settings` | text | 扩展配置（JSON 格式） |
+| `meta` | text | 扩展元数据（JSON 格式，包含版本、来源等） |
+
+### 7.2 配置发现流程
+
+扩展配置在系统启动时从数据库加载，并与文件系统发现的扩展进行同步。
+
+**核心同步逻辑**：
+
+```typescript
+// api/src/extensions/lib/get-extensions-settings.ts
+export async function getExtensionsSettings(options: {
+  database: Knex;
+  extensions: Extension[];
+}): Promise<ExtensionsSettingsMap> {
+  const { database, extensions } = options;
+
+  const existingSettings = await database
+    .select<ExtensionSettingsRow[]>('id', 'enabled', 'settings')
+    .from('directus_extensions');
+
+  const settingsMap: ExtensionsSettingsMap = new Map();
+
+  for (const extension of extensions) {
+    const existing = existingSettings.find((s) => s.id === extension.name);
+
+    if (existing) {
+      settingsMap.set(extension.name, {
+        enabled: existing.enabled,
+        settings: existing.settings ? JSON.parse(existing.settings) : null,
+      });
+    } else {
+      settingsMap.set(extension.name, {
+        enabled: extension.enabled ?? true,
+        settings: null,
+      });
+    }
+  }
+
+  return settingsMap;
+}
+```
+
+### 7.3 配置展示（UI 层）
+
+前端通过 Store 获取扩展列表，并在设置页面展示。
+
+**前端 Store 状态管理**：
+
+```typescript
+// app/src/stores/extensions.ts
+export const useExtensionsStore = defineStore('extensionsStore', () => {
+  const extensions = ref<Extension[]>([]);
+
+  async function hydrate() {
+    const response = await apiStore.request<{ data: Extension[] }>({
+      url: '/extensions',
+      method: 'GET',
+    });
+    extensions.value = response.data;
+  }
+
+  function checkForUpdates(newExtensions: Extension[]) {
+    const currentlyEnabled = extensions.value
+      .filter((e) => e.enabled)
+      .map((e) => e.id)
+      .sort();
+
+    const newEnabled = newExtensions
+      .filter((e) => e.enabled)
+      .map((e) => e.id)
+      .sort();
+
+    if (isEqual(currentlyEnabled, newEnabled) === false) {
+      notificationStore.add({
+        type: 'info',
+        title: t('extensions_reload_title'),
+        message: t('extensions_reload_message'),
+        persist: true,
+        dismissAction: {
+          label: t('refresh_page'),
+          action: () => window.location.reload(),
+        },
+      });
+    }
+
+    extensions.value = newExtensions;
+  }
+
+  return { extensions, hydrate, checkForUpdates };
+});
+```
+
+### 7.4 配置修改与持久化
+
+当用户在设置页修改扩展配置时，通过 API 服务层处理，并使用数据库事务保证一致性。
+
+**服务层更新逻辑**：
+
+```typescript
+// api/src/services/extensions.ts
+export class ExtensionsService extends ItemsService<Extension> {
+  async updateOne(id: string, data: DeepPartial<ApiOutput>): Promise<ApiOutput> {
+    const result = await transaction(this.knex, async (trx) => {
+      const service = new ItemsService('directus_extensions', {
+        ...this.options,
+        knex: trx,
+      });
+
+      const validationResult = this.validateUpdateData(id, data);
+      if (!validationResult.valid) {
+        throw new InvalidPayloadException(validationResult.reason);
+      }
+
+      const existing = await service.readOne(id, {
+        fields: ['id', 'bundle', 'enabled', 'settings'],
+      });
+
+      if (existing.bundle && data.enabled === true) {
+        const bundle = await service.readOne(existing.bundle);
+        if (bundle.enabled === false) {
+          throw new ForbiddenException(
+            `Cannot enable "${id}" because its bundle is disabled`
+          );
+        }
+      }
+
+      const updateData: Partial<Extension> = {};
+      if (data.enabled !== undefined) updateData.enabled = data.enabled;
+      if (data.settings !== undefined) {
+        updateData.settings = JSON.stringify(data.settings);
+      }
+      await service.updateOne(id, updateData);
+
+      if (existing.bundle === null && data.enabled === false) {
+        const children = await service.readMany([existing.id], {
+          fields: ['id'],
+          filter: { bundle: { _eq: existing.id } },
+        });
+        for (const child of children) {
+          await service.updateOne(child.id, { enabled: false });
+        }
+      }
+
+      return await service.readOne(id, {
+        fields: ['id', 'bundle', 'enabled', 'settings', 'meta'],
+      });
+    });
+
+    this.extensionsManager.reload().then(() => {
+      this.extensionsManager.broadcastReloadNotification();
+    });
+
+    return result;
+  }
+}
+```
+
+### 7.5 重载生效机制
+
+配置更新后，扩展管理器会触发重载，重新加载所有扩展。
+
+**扩展管理器重载方法**：
+
+```typescript
+// api/src/extensions/manager.ts
+public reload(options?: ExtensionSyncOptions): Promise<unknown> {
+  return this.reloadQueue.add(async () => {
+    const logger = createLogger('extensions');
+
+    try {
+      logger.info('Reloading extensions...');
+      await this.unload();
+      await this.initialize(options);
+      emitter.emitAction('extensions.reload', {
+        extensions: this.extensions.map((e) => e.name),
+        added: [],
+        removed: [],
+      });
+      logger.info('Reloaded extensions successfully');
+    } catch (error) {
+      logger.error(`Failed to reload extensions: ${error}`);
+    }
+  });
+}
+```
+
+**多进程广播机制**：
+
+```typescript
+// api/src/extensions/manager.ts
+public broadcastReloadNotification(): void {
+  const messenger = getMessenger();
+  messenger.publish('extensions.reload', { timestamp: Date.now() });
+}
+
+messenger.subscribe('extensions.reload', async () => {
+  await extensionManager.reload();
+});
+```
+
+### 7.6 前端反馈与刷新提示
+
+当后端重载完成后，前端需要感知变化并提示用户刷新页面。
+
+**前端刷新提示逻辑**：
+
+```typescript
+// app/src/stores/extensions.ts
+function checkForUpdates(newExtensions: Extension[]) {
+  const currentlyEnabled = extensions.value
+    .filter((e) => e.enabled)
+    .map((e) => e.id)
+    .sort();
+
+  const newEnabled = newExtensions
+    .filter((e) => e.enabled)
+    .map((e) => e.id)
+    .sort();
+
+  if (isEqual(currentlyEnabled, newEnabled) === false) {
+    notificationStore.add({
+      type: 'info',
+      title: t('extensions_reload_title'),
+      message: t('extensions_reload_message'),
+      persist: true,
+      dismissAction: {
+        label: t('refresh_page'),
+        action: () => window.location.reload(),
+      },
+    });
+  }
+
+  extensions.value = newExtensions;
+}
+```
+
+**完整链路流程图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        扩展配置完整链路流程图                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐          │
+│   │  用户操作 │───►│  前端 UI  │───►│ API 调用 │───►│ 服务层   │          │
+│   │  启用/禁用│    │ 开关切换  │    │ PATCH    │    │ 事务处理 │          │
+│   └──────────┘    └──────────┘    └──────────┘    └──────────┘          │
+│         ▲                                                    │              │
+│         │                                                    ▼              │
+│         │                                            ┌──────────┐          │
+│         │              刷新提示                      │ 数据库   │          │
+│         │    ┌─────────────────────────┐            │ 更新记录 │          │
+│         │    │ notificationStore.add() │            └──────────┘          │
+│         │    │ "需要刷新页面才能生效"    │                 │              │
+│         │    └─────────────────────────┘                 ▼              │
+│         │                                            ┌──────────┐          │
+│         │              刷新页面                      │ 异步重载 │          │
+│         │    ┌─────────────────────────┐            │ reload() │          │
+│         └────│ window.location.reload()│            └──────────┘          │
+│              └─────────────────────────┘                 │              │
+│                                                           ▼              │
+│                                                    ┌──────────┐          │
+│                              多进程同步            │ 消息总线 │          │
+│                         ┌──────────────────┐     │ publish  │          │
+│                         │ other workers    │     └──────────┘          │
+│                         │ 收到通知后重载   │                              │
+│                         └──────────────────┘                              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**链路关键节点总结**：
+
+| 阶段 | 组件 | 关键操作 | 文件位置 |
+|------|------|----------|----------|
+| 用户交互 | ExtensionItem.vue | 开关切换，调用 API | `app/src/.../ExtensionItem.vue` |
+| API 处理 | ExtensionsController | 路由转发到服务层 | `api/src/controllers/extensions.ts` |
+| 事务处理 | ExtensionsService | 验证、更新、Bundle 同步 | `api/src/services/extensions.ts` |
+| 持久化 | Knex/数据库 | 更新 `directus_extensions` 表 | 数据库迁移定义 |
+| 重载触发 | ExtensionManager | `reload()` 加入串行队列 | `api/src/extensions/manager.ts` |
+| 多进程同步 | Messenger | `publish('extensions.reload')` | `api/src/bus/lib/use-bus.ts` |
+| 前端反馈 | ExtensionsStore | `checkForUpdates()` 检测变化 | `app/src/stores/extensions.ts` |
+
+---
+
+## 8. 失败与异常处理
+
+本章详细分析扩展配置链路中的各种失败场景和异常处理机制。
+
+### 8.1 后端异常处理
+
+**服务层异常类型**：
+
+```typescript
+// 1. 数据验证失败
+throw new InvalidPayloadException('Field "id" is read-only');
+throw new InvalidPayloadException('Invalid settings JSON');
+
+// 2. 权限不足
+throw new ForbiddenException(
+  `Cannot enable "${id}" because its bundle is disabled`
+);
+
+// 3. 记录不存在
+throw new RecordNotFoundException(`Extension "${id}" not found`);
+```
+
+**事务回滚机制**：
+
+```typescript
+// api/src/services/extensions.ts
+async updateOne(id: string, data: DeepPartial<ApiOutput>) {
+  const result = await transaction(this.knex, async (trx) => {
+    const service = new ItemsService('directus_extensions', {
+      ...this.options,
+      knex: trx,
+    });
+
+    const validation = this.validateUpdateData(id, data);
+    if (!validation.valid) {
+      throw new InvalidPayloadException(validation.reason);
+    }
+
+    const existing = await service.readOne(id, { ... });
+
+    if (existing.bundle && data.enabled === true) {
+      const bundle = await service.readOne(existing.bundle);
+      if (bundle.enabled === false) {
+        throw new ForbiddenException(...);
+      }
+    }
+
+    await service.updateOne(id, updateData);
+    return await service.readOne(id, { ... });
+  });
+
+  this.extensionsManager.reload().then(() => {
+    this.extensionsManager.broadcastReloadNotification();
+  });
+
+  return result;
+}
+```
+
+**扩展加载错误处理**：
+
+```typescript
+// api/src/extensions/manager.ts
+private handleExtensionError({ error, reason }: {
+  error: Error;
+  reason: string;
+}) {
+  const logger = createLogger('extensions');
+
+  if (env['EXTENSIONS_MUST_LOAD']) {
+    logger.error(reason);
+    process.exit(1);
+  } else {
+    logger.warn(reason);
+  }
+}
+```
+
+### 8.2 前端异常处理
+
+**API 调用错误处理**：
+
+```typescript
+// app/src/modules/settings/routes/extensions/components/ExtensionItem.vue
+async function toggleEnabled() {
+  const originalEnabled = props.extension.enabled;
+  isLoading.value = true;
+
+  try {
+    await apiStore.request({
+      url: `/extensions/${props.extension.id}`,
+      method: 'PATCH',
+      data: { enabled: props.extension.enabled },
+    });
+
+    await extensionsStore.hydrate();
+    extensionsStore.checkForUpdates(extensionsStore.extensions);
+  } catch (error) {
+    props.extension.enabled = originalEnabled;
+
+    notificationStore.add({
+      type: 'error',
+      title: t('unexpected_error'),
+      message: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    isLoading.value = false;
+  }
+}
+```
+
+**前端错误类型**：
+
+| 错误类型 | 触发场景 | 用户反馈 |
+|----------|----------|----------|
+| 网络错误 | API 调用失败 | 红色通知条，显示错误信息 |
+| 权限错误 | 无权限修改扩展 | 红色通知条，显示 "Forbidden" |
+| 验证错误 | 无效的配置参数 | 红色通知条，显示验证失败原因 |
+| 状态冲突 | Bundle 已禁用时启用子扩展 | 红色通知条，显示具体原因 |
+
+### 8.3 部分失败场景
+
+**场景 1：事务成功但重载失败**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    部分失败：重载失败                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  结果：                                                         │
+│  ✅ 数据库状态：扩展 A 已标记为禁用                              │
+│  ❌ 运行时状态：扩展 A 仍在运行（因为重载失败）                   │
+│                                                                 │
+│  影响：                                                         │
+│  - 下次系统重启时，扩展 A 会被正确禁用                           │
+│  - 或者用户手动再次触发重载                                      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**场景 2：多进程环境下部分进程重载失败**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              部分失败：多进程环境中的不一致                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Worker 1: ✅ 收到消息 → ✅ 重载成功 → 状态：扩展已禁用         │
+│  Worker 2: ✅ 收到消息 → ❌ 重载失败 → 状态：扩展仍在运行       │
+│  Worker 3: ❌ 未收到消息 → 状态：扩展仍在运行                    │
+│                                                                 │
+│  结果：请求负载到不同 Worker 时，行为不一致                     │
+│                                                                 │
+│  缓解措施：                                                      │
+│  1. 消息总线使用 Redis（支持持久化和重试）                      │
+│  2. 每个 Worker 独立的重载队列（确保至少尝试执行）               │
+│  3. 定期健康检查（检测不一致状态）                               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 8.4 失败恢复机制
+
+**自动恢复：文件监视**
+
+```typescript
+// api/src/extensions/manager.ts
+private setupFileWatcher(): void {
+  if (env['NODE_ENV'] !== 'development') return;
+
+  const watcher = chokidar.watch(
+    path.join(env['EXTENSIONS_PATH'], '**', 'index.js'),
+    { ignoreInitial: true }
+  );
+
+  const debouncedReload = debounce(() => {
+    this.reload();
+  }, 500);
+
+  watcher.on('change', () => debouncedReload());
+  watcher.on('add', () => debouncedReload());
+  watcher.on('unlink', () => debouncedReload());
+}
+```
+
+**错误恢复策略总结**：
+
+| 失败场景 | 自动恢复 | 手动恢复 | 预防措施 |
+|----------|----------|----------|----------|
+| 扩展加载失败 | ❌ 记录警告，继续运行 | 修复代码后重载 | `EXTENSIONS_MUST_LOAD` 严格模式 |
+| 重载失败 | ❌ 记录错误 | 手动触发重载 | 测试扩展代码 |
+| 多进程不一致 | ❌ 无 | 重启所有 Worker | 使用可靠的消息总线 |
+| 事务失败 | ✅ 自动回滚 | 重试操作 | 数据验证 |
+| 前端状态不一致 | ❌ 提示刷新 | 用户手动刷新 | WebSocket 实时同步 |
+
+---
+
+## 9. 关键代码位置
+
+### 9.1 后端核心文件
 
 | 文件路径 | 说明 |
 |----------|------|
@@ -1131,7 +1667,7 @@ emitter.onAction('extensions.reload', ({ added, removed }) => {
 | `api/src/services/extensions.ts` | 扩展 API 服务 |
 | `api/src/controllers/extensions.ts` | 扩展 HTTP 端点 |
 
-### 7.2 前端核心文件
+### 9.2 前端核心文件
 
 | 文件路径 | 说明 |
 |----------|------|
