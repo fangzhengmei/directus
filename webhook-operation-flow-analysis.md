@@ -892,7 +892,522 @@ flow.options['return'] = flow.options['return'] ?? '$last';  // 默认返回最�
 
 ---
 
-## 十一、相关测试文件
+## 十一、Trigger Operation 触发链分析
+
+### 11.1 Trigger Operation 核心实现
+
+**文件**: `api/src/operations/trigger/index.ts`
+
+Trigger Operation 用于在一个 Flow 中触发另一个 Flow（目标 Flow 的 trigger 类型必须为 `'operation'`）。
+
+**配置选项**:
+
+```typescript
+type Options = {
+    flow: string;                                    // 目标 Flow 的 ID
+    payload?: Record<string, any> | Record<string, any>[] | string | null;  // 传递给目标 Flow 的数据
+    iterationMode?: 'serial' | 'batch' | 'parallel';  // 迭代模式（仅当 payload 为数组时生效）
+    batchSize?: number;                              // 批处理大小（默认 10，仅 batch 模式有效）
+};
+```
+
+### 11.2 Payload 传递机制
+
+**执行流程**:
+
+```typescript
+handler: async ({ flow, payload, iterationMode, batchSize }, context) => {
+    const flowManager = getFlowManager();
+
+    // 1. Payload 转换：支持 JSON 字符串
+    const payloadObject = optionToObject(payload) ?? null;
+
+    // 2. 判断是否为数组
+    if (Array.isArray(payloadObject)) {
+        // 数组 → 根据 iterationMode 选择迭代模式
+        // ... 三种迭代模式实现
+    }
+
+    // 3. 非数组 → 单次执行
+    return await flowManager.runOperationFlow(flow, payloadObject, omit(context, 'data'));
+}
+```
+
+**关键点**:
+
+1. **Payload 类型支持**:
+   - `null` → 传递 `null`
+   - 对象 `{ key: value }` → 直接传递
+   - 数组 `[item1, item2, ...]` → 迭代执行
+   - JSON 字符串 `'{"key": "value"}'` → 先解析为对象
+
+2. **上下文处理**:
+   - 使用 `omit(context, 'data')` 传递上下文
+   - 移除 `data` 字段（避免传递完整的 keyedData 给子 Flow）
+
+### 11.3 三种迭代模式详解
+
+#### 模式一：Serial（串行）
+
+**适用场景**: 需要严格顺序执行、前一个结果影响后一个、或需要限制并发的场景。
+
+**实现代码**:
+
+```typescript
+if (iterationMode === 'serial') {
+    const result = [];
+
+    for (const payload of payloadObject) {
+        // 等待前一个完成后才执行下一个
+        result.push(await flowManager.runOperationFlow(flow, payload, omit(context, 'data')));
+    }
+
+    return result;
+}
+```
+
+**执行时序图**:
+
+```
+时间轴 ──────────────────────────────────────────────────────────────►
+
+payload[0]  ├─────────────────┤
+payload[1]                      ├─────────────────┤
+payload[2]                                        ├─────────────────┤
+...
+
+总耗时 = sum(每个执行时间)
+```
+
+**特点**:
+- 完全顺序执行
+- 任何一个失败会终止后续执行（除非有错误处理）
+- 适用于依赖关系强的任务
+
+#### 模式二：Batch（分批并行）
+
+**适用场景**: 数据量大、需要控制并发数、避免系统资源耗尽。
+
+**实现代码**:
+
+```typescript
+if (iterationMode === 'batch') {
+    const size = batchSize ?? 10;  // 默认每批 10 个
+
+    const result = [];
+
+    for (let i = 0; i < payloadObject.length; i += size) {
+        const batch = payloadObject.slice(i, i + size);
+
+        // 批次内并行执行
+        const batchResults = await Promise.all(
+            batch.map((payload) => {
+                return flowManager.runOperationFlow(flow, payload, omit(context, 'data'));
+            }),
+        );
+
+        result.push(...batchResults);
+    }
+
+    return result;
+}
+```
+
+**执行时序图**（batchSize = 2，共 5 个 item）:
+
+```
+时间轴 ──────────────────────────────────────────────────────────────►
+
+批次 1:
+payload[0]  ├─────────────────┤
+payload[1]  ├─────────────────┤
+
+批次 2:
+payload[2]                      ├─────────────┤
+payload[3]                      ├─────────────┤
+
+批次 3:
+payload[4]                                        ├─────────┤
+
+总耗时 = max(批次1) + max(批次2) + max(批次3)
+```
+
+**特点**:
+- 批次内并行，批次间串行
+- 通过 `batchSize` 控制并发数
+- 平衡了性能和资源消耗
+- 任何一个批次内的失败会终止后续批次
+
+#### 模式三：Parallel（并行，默认）
+
+**适用场景**: 数据量小、任务之间无依赖、需要最快完成。
+
+**实现代码**:
+
+```typescript
+if (iterationMode === 'parallel' || !iterationMode) {
+    // 所有项一次性并行执行
+    return await Promise.all(
+        payloadObject.map((payload) => {
+            return flowManager.runOperationFlow(flow, payload, omit(context, 'data'));
+        }),
+    );
+}
+```
+
+**执行时序图**:
+
+```
+时间轴 ──────────────────────────────────────────────────────────────►
+
+payload[0]  ├─────────────────┤
+payload[1]  ├─────────────┤
+payload[2]  ├───────────────────────┤
+payload[3]  ├───────┤
+...
+
+总耗时 = max(所有执行时间)
+```
+
+**特点**:
+- 所有项同时启动
+- 最快的执行方式
+- 但可能消耗大量系统资源
+- 任何一个失败会导致整个 `Promise.all` 失败
+
+### 11.4 三种模式对比
+
+| 特性 | Serial | Batch | Parallel |
+|------|--------|-------|----------|
+| **执行顺序** | 完全串行 | 批次间串行，批次内并行 | 完全并行 |
+| **并发控制** | 无（始终 1） | 通过 batchSize 控制 | 无（等于数组长度） |
+| **总耗时** | 最长（累加） | 中等 | 最短（取最大值） |
+| **资源消耗** | 最低 | 可控 | 最高 |
+| **适用场景** | 强依赖任务 | 大数据量 | 小数据量、无依赖 |
+| **失败处理** | 立即终止 | 批次内失败终止后续 | 任一失败则全部失败 |
+
+### 11.5 Operation Trigger Flow 的注册与执行
+
+**目标 Flow 注册**（`api/src/flows.ts:243-246`）:
+
+```typescript
+} else if (flow.trigger === 'operation') {
+    const handler = (data: unknown, context: Record<string, unknown>) => 
+        this.executeFlow(flow, data, context);
+
+    this.operationFlowHandlers[flow.id] = handler;
+}
+```
+
+**调用入口**（`api/src/flows.ts:118-131`）:
+
+```typescript
+public async runOperationFlow(id: string, data: unknown, context: Record<string, unknown>): Promise<unknown> {
+    if (this.reloadQueue.pending > 0) await this.reloadQueue.onIdle();
+
+    const logger = useLogger();
+
+    if (!(id in this.operationFlowHandlers)) {
+        logger.warn(`Couldn't find operation triggered flow with id "${id}"`);
+        return null;
+    }
+
+    const handler = this.operationFlowHandlers[id];
+
+    return handler(data, context);
+}
+```
+
+---
+
+## 十二、端到端时序小结
+
+### 12.1 完整调用链路概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           端到端完整执行链路                                           │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────┐
+  │  触发源       │  (Event / Webhook / Manual / Schedule)
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │  主 Flow A   │  ────────────────────────────────────────────────────┐
+  └──────┬───────┘                                                      │
+         │                                                               │
+         ▼                                                               │
+  ┌───────────────────┐                                                   │
+  │ Operation: Step 1 │  (e.g., item-read / condition / transform)     │
+  └─────────┬─────────┘                                                   │
+            │                                                              │
+            ▼                                                              │
+  ┌─────────────────────────────┐                                         │
+  │ Operation: Trigger (关键)   │ ◄─────────────────────────────────────┤
+  │  - flow: "flow-b-id"        │                                         │
+  │  - payload: [...]           │                                         │
+  │  - iterationMode: "batch"   │                                         │
+  └─────────────┬───────────────┘                                         │
+                │                                                          │
+                │ 调用                                                      │
+                ▼                                                          │
+  ┌───────────────────────────────────────────────────────────────┐      │
+  │              FlowManager.runOperationFlow()                    │      │
+  │  (api/src/flows.ts:118-131)                                   │      │
+  └───────────────────────┬───────────────────────────────────────┘      │
+                          │                                                  │
+                          ▼                                                  │
+  ┌───────────────────────────────────────────────────────────────┐      │
+  │              目标 Flow B (trigger: 'operation')                │      │
+  │  ┌─────────────────────────────────────────────────────────┐  │      │
+  │  │  1. 初始化 keyedData:                                      │  │      │
+  │  │     {                                                       │  │      │
+  │  │       $trigger: payload[i],  // 来自 Trigger Operation    │  │      │
+  │  │       $last: payload[i],                                    │  │      │
+  │  │       $accountability: ...,                                 │  │      │
+  │  │       $env: ...                                             │  │      │
+  │  │     }                                                       │  │      │
+  │  │                                                             │  │      │
+  │  │  2. 执行操作链:                                             │  │      │
+  │  │     executeOperation() 循环                                 │  │      │
+  │  │                                                             │  │      │
+  │  │  3. 返回结果:                                               │  │      │
+  │  │     根据 flow.options['return'] 配置                        │  │      │
+  │  └─────────────────────────────────────────────────────────┘  │      │
+  └───────────────────────────────┬───────────────────────────────┘      │
+                                  │                                          │
+                                  │ (如果是数组，按 iterationMode 迭代)      │
+                                  │                                          │
+                                  ▼                                          │
+  ┌───────────────────────────────────────────────────────────────┐      │
+  │              主 Flow A 继续执行                                 │      │
+  │  - keyedData['trigger_key'] = Flow B 的执行结果               │      │
+  │  - keyedData['$last'] = Flow B 的执行结果                     │      │
+  └───────────────────────────────┬───────────────────────────────┘      │
+                                  │                                          │
+                                  ▼                                          │
+  ┌───────────────────────────────────────────────────────────────┐      │
+  │              主 Flow A 后续操作                                 │      │
+  │  (可以使用 {{ $last }} 或 {{ trigger_key }} 引用)             │      │
+  └───────────────────────────────┬───────────────────────────────┘      │
+                                  │                                          │
+                                  ▼                                          │
+  ┌───────────────────────────────────────────────────────────────┐      │
+  │              记录审计日志 (根据 accountability 配置)            │◄─────┘
+  │  - Activity 记录                                                │
+  │  - Revision 记录（如果 accountability === 'all'）               │
+  └───────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 详细时序图
+
+**场景**: 主 Flow A 通过 Trigger Operation 触发子 Flow B，payload 为数组，使用 batch 模式。
+
+```
+时间轴 ─────────────────────────────────────────────────────────────────────────────────►
+
+  主 Flow A                                                                   子 Flow B
+  ──────────                                                                   ────────
+       │
+       ▼
+  ┌─────────┐
+  │ $trigger│ ◄── 来自 Event/Webhook/Schedule
+  └────┬────┘
+       │
+       ▼
+  ┌─────────────┐
+  │ Operation 1 │ (e.g., item-read)
+  └──────┬──────┘
+       │
+       ▼
+  ┌───────────────────┐
+  │ Trigger Operation │
+  │ ┌───────────────┐ │
+  │ │ flow: "B"     │ │
+  │ │ payload:      │ │
+  │ │   [item0,     │ │
+  │ │    item1,     │ │
+  │ │    item2,     │ │
+  │ │    item3]     │ │
+  │ │ iterationMode:│ │
+  │ │   "batch"     │ │
+  │ │ batchSize: 2  │ │
+  │ └───────────────┘ │
+  └─────────┬─────────┘
+            │
+            │ 调用 runOperationFlow("B", item0) ───────────────────┐
+            │ 调用 runOperationFlow("B", item1) ─────────────────┐ │
+            │                                                       │ │
+            ▼                                                       ▼ ▼
+  ┌───────────────────┐                                    ┌───────────────────┐
+  │ 等待批次 1 完成    │◄──────────────────────────────────│ Flow B: item0     │
+  │                   │                                    │ Flow B: item1     │
+  └─────────┬─────────┘                                    └─────────┬─────────┘
+            │                                                         │
+            │ 调用 runOperationFlow("B", item2) ───────────────────┐ │
+            │ 调用 runOperationFlow("B", item3) ─────────────────┐ │ │
+            │                                                       │ │ │
+            ▼                                                       ▼ ▼ ▼
+  ┌───────────────────┐                                    ┌───────────────────┐
+  │ 等待批次 2 完成    │◄──────────────────────────────────│ Flow B: item2     │
+  │                   │                                    │ Flow B: item3     │
+  └─────────┬─────────┘                                    └─────────┬─────────┘
+            │                                                         │
+            │ 收集所有结果: [result0, result1, result2, result3]     │
+            ▼                                                         │
+  ┌───────────────────┐                                              │
+  │ keyedData 更新:   │                                              │
+  │ $last = results   │                                              │
+  │ trigger_op_key =  │                                              │
+  │   results          │                                              │
+  └─────────┬─────────┘                                              │
+            │                                                          │
+            ▼                                                          │
+  ┌───────────────────┐                                              │
+  │ Operation 3       │ (使用 {{ $last }} 引用子 Flow 结果)         │
+  └─────────┬─────────┘                                              │
+            │                                                          │
+            ▼                                                          │
+  ┌───────────────────┐                                              │
+  │ 记录审计日志       │                                              │
+  │ (Activity +       │                                              │
+  │  Revision)        │                                              │
+  └───────────────────┘                                              │
+```
+
+### 12.3 关键数据流转表
+
+| 阶段 | 数据位置 | 说明 |
+|------|----------|------|
+| **主 Flow 触发** | `keyedData['$trigger']` | 来自 Event/Webhook/Schedule 的原始数据 |
+| **主 Flow 操作执行** | `keyedData['<operation_key>']` | 每个操作的结果保存到其 key |
+| **主 Flow 操作执行** | `keyedData['$last']` | 始终指向最后一个操作的结果 |
+| **Trigger Operation 准备** | `options.payload` | 经过 `applyOptionsData` 模板替换后的 payload |
+| **子 Flow 触发** | `keyedData['$trigger']` (子 Flow 内) | 来自父 Flow 的单个 payload 项 |
+| **子 Flow 返回** | `flowManager.runOperationFlow()` 返回值 | 子 Flow 的 `flow.options['return']` 配置的值 |
+| **主 Flow 继续** | `keyedData['$last']` | 子 Flow 执行结果（数组或单个值） |
+| **主 Flow 继续** | `keyedData['<trigger_op_key>']` | 子 Flow 执行结果（可通过操作 key 引用） |
+
+### 12.4 配置示例：嵌套 Flow 批量处理
+
+**场景**: 从 `orders` 表读取所有待处理订单，然后为每个订单触发一个子 Flow 进行处理。
+
+**主 Flow 配置** (trigger: 'schedule', 每小时执行):
+
+```typescript
+{
+    trigger: 'schedule',
+    options: {
+        cron: '0 * * * *'
+    },
+    accountability: 'activity',
+    operation: {
+        key: 'read_pending_orders',
+        type: 'item-read',
+        options: {
+            collection: 'orders',
+            query: {
+                filter: {
+                    status: { _eq: 'pending' }
+                }
+            }
+        },
+        resolve: {
+            key: 'process_each_order',
+            type: 'trigger',
+            options: {
+                flow: 'sub-flow-order-processor',  // 子 Flow ID
+                payload: '{{ $last }}',            // 使用上一步读取的订单数组
+                iterationMode: 'batch',             // 分批处理
+                batchSize: 5                        // 每批 5 个
+            },
+            resolve: {
+                key: 'notify_complete',
+                type: 'request',
+                options: {
+                    method: 'POST',
+                    url: 'https://api.example.com/notify',
+                    body: {
+                        message: '批量处理完成，共处理 {{ $last.length }} 个订单'
+                    }
+                },
+                resolve: null,
+                reject: null
+            },
+            reject: null
+        },
+        reject: null
+    }
+}
+```
+
+**子 Flow 配置** (trigger: 'operation'):
+
+```typescript
+{
+    trigger: 'operation',
+    options: {
+        return: '$last'
+    },
+    accountability: 'all',
+    operation: {
+        key: 'validate_order',
+        type: 'condition',
+        options: {
+            filter: {
+                '$trigger.amount': { _gt: 0 }
+            }
+        },
+        resolve: {
+            key: 'update_status',
+            type: 'item-update',
+            options: {
+                collection: 'orders',
+                key: '{{ $trigger.id }}',
+                payload: {
+                    status: 'processed',
+                    processed_at: '{{ $timestamp }}'
+                }
+            },
+            resolve: {
+                key: 'send_confirmation',
+                type: 'request',
+                options: {
+                    method: 'POST',
+                    url: 'https://api.example.com/send-email',
+                    body: {
+                        to: '{{ $trigger.customer_email }}',
+                        subject: '订单确认',
+                        order_id: '{{ $trigger.id }}'
+                    }
+                },
+                resolve: null,
+                reject: null
+            },
+            reject: null
+        },
+        reject: {
+            key: 'mark_invalid',
+            type: 'item-update',
+            options: {
+                collection: 'orders',
+                key: '{{ $trigger.id }}',
+                payload: {
+                    status: 'invalid'
+                }
+            },
+            resolve: null,
+            reject: null
+        }
+    }
+}
+```
+
+---
+
+## 十三、相关测试文件
 
 | 测试文件 | 覆盖范围 |
 |----------|----------|
