@@ -15,15 +15,12 @@
 │  └──────────────┘  └──────────────┘  └──────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                                           │
-                                          ▼ HTTP API (REST/GraphQL)
+                                          ▼ HTTP API (REST/GraphQL) / WebSocket
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                                API Controllers                                         │
 │  ┌─────────────────────────────────────┐  ┌──────────────────────────────────────┐  │
 │  │ permissions.ts (权限 CRUD)           │  │ roles.ts (角色 CRUD)                 │  │
-│  │ - POST /permissions                  │  │ - POST /roles                        │  │
-│  │ - GET /permissions                   │  │ - GET /roles/:id                     │  │
-│  │ - PATCH /permissions                 │  │ - PATCH /roles/:id                   │  │
-│  │ - DELETE /permissions                │  │ - DELETE /roles/:id                  │  │
+│  │ graphql.ts (GraphQL 端点)            │  │ access.ts (策略关联 CRUD)            │  │
 │  └─────────────────────────────────────┘  └──────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                                           │
@@ -33,8 +30,8 @@
 │  ┌───────────────────────────────┐  ┌──────────────────────────────────────────────┐ │
 │  │ PermissionsService            │  │ RolesService                                │ │
 │  │ (api/src/services/permissions.ts)│  │ (api/src/services/roles.ts)               │ │
-│  │ - 操作 directus_permissions 表 │  │ - 操作 directus_roles 表                   │ │
-│  │ - 权限变更时清除系统缓存        │  │ - 角色删除时级联清理权限/预设              │ │
+│  │ AccessService                 │  │ GraphQLService                              │ │
+│  │ (api/src/services/access.ts)    │  │ (api/src/services/graphql/index.ts)       │ │
 │  └───────────────────────────────┘  └──────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                                           │
@@ -227,7 +224,82 @@ override async deleteMany(keys: PrimaryKey[], opts: MutationOptions = {}): Promi
 }
 ```
 
-### 2.4 数据库表结构详解
+### 2.4 角色与策略绑定（AccessService）
+
+**关键文件：** `api/src/services/access.ts`
+
+角色与策略的绑定关系存储在 `directus_access` 表中，由 `AccessService` 管理：
+
+```typescript
+export class AccessService extends ItemsService {
+  constructor(options: AbstractServiceOptions) {
+    super('directus_access', options);  // 操作 directus_access 表
+  }
+
+  private async clearCaches(opts?: MutationOptions) {
+    await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+
+    if (this.cache && opts?.autoPurgeCache !== false) {
+      await this.cache.clear();
+    }
+  }
+
+  override async createOne(data: Partial<Item>, opts: MutationOptions = {}): Promise<PrimaryKey> {
+    // 创建新的策略关联会影响 admin/app/api 用户数量
+    opts.userIntegrityCheckFlags =
+      (opts.userIntegrityCheckFlags ?? UserIntegrityCheckFlag.None) | UserIntegrityCheckFlag.UserLimits;
+
+    opts.onRequireUserIntegrityCheck?.(opts.userIntegrityCheckFlags);
+
+    const result = await super.createOne(data, opts);
+
+    // 策略关联变更，清除缓存
+    await this.clearCaches();
+
+    return result;
+  }
+
+  override async updateMany(
+    keys: PrimaryKey[],
+    data: Partial<Item>,
+    opts: MutationOptions = {},
+  ): Promise<PrimaryKey[]> {
+    // 更新策略关联可能影响用户数量
+    opts.userIntegrityCheckFlags = UserIntegrityCheckFlag.All;
+    opts.onRequireUserIntegrityCheck?.(opts.userIntegrityCheckFlags);
+
+    const result = await super.updateMany(keys, data, { ...opts, userIntegrityCheckFlags: UserIntegrityCheckFlag.All });
+
+    await this.clearCaches();  // 清除缓存
+
+    return result;
+  }
+
+  override async deleteMany(keys: PrimaryKey[], opts: MutationOptions = {}): Promise<PrimaryKey[]> {
+    // 删除策略关联可能影响用户数量
+    opts.userIntegrityCheckFlags = UserIntegrityCheckFlag.All;
+    opts.onRequireUserIntegrityCheck?.(opts.userIntegrityCheckFlags);
+
+    const result = await super.deleteMany(keys, opts);
+
+    await this.clearCaches();  // 清除缓存
+
+    return result;
+  }
+}
+```
+
+#### directus_access 表结构
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | UUID | 主键 |
+| `role` | UUID | 角色 ID（可为空，支持用户级策略） |
+| `user` | UUID | 用户 ID（可为空，支持角色级策略） |
+| `policy` | UUID | 策略 ID（必填） |
+| `sort` | int | 排序顺序 |
+
+### 2.5 数据库表结构详解
 
 #### 核心表关系（v11 引入策略系统）
 
@@ -316,9 +388,957 @@ export type Permission = {
 
 ---
 
-## 三、权限执行链路（请求到达 → 权限验证 → 数据访问）
+## 三、fetchPolicies 装载与权限合并链路
 
-### 3.1 请求处理流程图
+### 3.1 整体流程概览
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                    fetchPolicies 装载与权限合并完整流程                          │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  1. 配置阶段（UI → Database）                                                  │
+│     ┌──────────┐     ┌─────────────────┐     ┌─────────────────┐           │
+│     │ 角色管理  │────►│ directus_access │────►│ directus_policy │           │
+│     │ 策略管理  │     │  (关联绑定)      │     │  (权限策略)     │           │
+│     └──────────┘     └─────────────────┘     └─────────────────┘           │
+│                                                                                │
+│  2. 运行阶段（请求处理）                                                        │
+│                                                                                │
+│     ┌────────────────────────────────────────────────────────────────────┐  │
+│     │  authenticate.ts (认证中间件)                                         │  │
+│     │  └── getAccountabilityForToken()                                     │  │
+│     │      └── fetchRolesTree() → 构建角色继承树                           │  │
+│     │      └── fetchGlobalAccess() → 检查 admin_access                    │  │
+│     └────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                        │
+│                                      ▼                                        │
+│     ┌────────────────────────────────────────────────────────────────────┐  │
+│     │  processAst() / validateAccess() (权限检查核心)                     │  │
+│     │  └── fetchPolicies() → 从 directus_access 加载策略                 │  │
+│     │      │                                                               │  │
+│     │      ├── 1. 构建过滤条件                                             │  │
+│     │      │    - 有角色：role IN (roles 树)                             │  │
+│     │      │    - 有用户：OR user = current_user                         │  │
+│     │      │    - 无角色无用户：Public 角色 (role IS NULL)               │  │
+│     │      │                                                               │  │
+│     │      ├── 2. 查询 directus_access                                     │  │
+│     │      │    SELECT policy.id, policy.ip_access, role                  │  │
+│     │      │    FROM directus_access                                       │  │
+│     │      │    LEFT JOIN directus_policies ON policy = policy.id        │  │
+│     │      │    WHERE [过滤条件]                                           │  │
+│     │      │                                                               │  │
+│     │      ├── 3. IP 过滤 (filterPoliciesByIp)                            │  │
+│     │      │    - 检查 policy.ip_access 是否包含当前请求 IP               │  │
+│     │      │                                                               │  │
+│     │      ├── 4. 优先级排序                                               │  │
+│     │      │    - 父角色策略 < 子角色策略 < 用户策略                      │  │
+│     │      │    - 基于 roles 数组的索引顺序                               │  │
+│     │      │                                                               │  │
+│     │      └── 5. 缓存 (withCache)                                        │  │
+│     │           - Key: policies-{hash(roles, user, ip)}                 │  │
+│     │           - 自动清除：权限变更时                                     │  │
+│     └────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                        │
+│                                      ▼                                        │
+│     ┌────────────────────────────────────────────────────────────────────┐  │
+│     │  fetchPermissions() (获取具体权限规则)                              │  │
+│     │  ├── 从 directus_permissions 查询                                   │  │
+│     │  │   WHERE policy IN (policies 列表)                               │  │
+│     │  │   AND collection IN (目标集合)                                   │  │
+│     │  │   AND action = (目标操作)                                        │  │
+│     │  │                                                                  │  │
+│     │  ├── 动态变量处理                                                   │  │
+│     │  │   - $CURRENT_USER, $CURRENT_ROLE 等                           │  │
+│     │  │   - 替换为实际值                                                 │  │
+│     │  │                                                                  │  │
+│     │  └── 权限合并 (mergePermissions)                                   │  │
+│     │      - 多个策略的权限规则如何合并                                   │  │
+│     └────────────────────────────────────────────────────────────────────┘  │
+│                                                                                │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 WebSocket 认证详细流程
+
+**关键文件：** `api/src/websocket/authenticate.ts`
+
+WebSocket 支持三种认证方式，最终都通过 `getAccountabilityForToken()` 构建 `accountability` 对象：
+
+```typescript
+export async function authenticateConnection(
+	message: BasicAuthMessage & Record<string, any>,
+	accountabilityOverrides?: Partial<Accountability>,
+): Promise<AuthenticationState> {
+	let access_token: string | undefined, refresh_token: string | undefined;
+
+	try {
+		// 方式 1：用户名密码登录
+		if ('email' in message && 'password' in message) {
+			const authenticationService = new AuthenticationService({ schema: await getSchema() });
+			const { accessToken, refreshToken } = await authenticationService.login(DEFAULT_AUTH_PROVIDER, message);
+			access_token = accessToken;
+			refresh_token = refreshToken;
+		}
+
+		// 方式 2：Refresh Token 刷新
+		if ('refresh_token' in message) {
+			const authenticationService = new AuthenticationService({ schema: await getSchema() });
+			const { accessToken, refreshToken } = await authenticationService.refresh(message.refresh_token);
+			access_token = accessToken;
+			refresh_token = refreshToken;
+		}
+
+		// 方式 3：直接使用 Access Token
+		if ('access_token' in message) {
+			access_token = message.access_token;
+		}
+
+		if (!access_token) throw new Error();
+
+		// 构建默认 accountability（包含 IP 地址）
+		const defaultAccountability = createDefaultAccountability(accountabilityOverrides);
+
+		const authenticationState = {
+			accountability: defaultAccountability,
+			expires_at: getExpiresAtForToken(access_token),
+			refresh_token,
+		} as AuthenticationState;
+
+		// 触发自定义认证钩子
+		const customAccountability = await emitter.emitFilter(
+			'websocket.authenticate',
+			defaultAccountability,
+			{ message },
+			{ database: getDatabase(), schema: null, accountability: null },
+		);
+
+		// 使用自定义 accountability 或从 Token 构建
+		if (customAccountability && isEqual(customAccountability, defaultAccountability) === false) {
+			authenticationState.accountability = customAccountability;
+		} else {
+			// 与 HTTP 认证相同的流程：解析 JWT → 构建角色树 → 检查 admin/app 权限
+			authenticationState.accountability = await getAccountabilityForToken(
+				access_token, 
+				defaultAccountability
+			);
+		}
+
+		return authenticationState;
+	} catch {
+		throw new WebSocketError('auth', 'AUTH_FAILED', 'Authentication failed.', message['uid']);
+	}
+}
+```
+
+### 6.3 verifyPermissions 核心实现
+
+**关键文件：** `api/src/websocket/collab/verify-permissions.ts`
+
+这是 WebSocket 协作权限校验的核心函数，与 REST API 的权限检查相比有以下特点：
+- 独立的缓存机制（permissionCache）
+- 动态变量解析支持
+- 返回允许的字段列表而非抛出异常
+
+```typescript
+export async function verifyPermissions(
+	accountability: Accountability | null,
+	collection: string,
+	item: PrimaryKey | null,
+	action: 'create' | 'read' | 'update' | 'delete' = 'read',
+	options: { knex: Knex; schema: SchemaOverview },
+): Promise<string[] | null> {
+	// 1. 无 accountability：返回空列表（无权限）
+	if (!accountability) return [];
+
+	const { schema, knex } = options;
+
+	// 2. 集合不存在：返回空列表
+	if (!schema.collections[collection]) return [];
+
+	// 3. 管理员：返回全部字段
+	if (accountability.admin) return ['*'];
+
+	// 4. 尝试从缓存获取
+	const cached = permissionCache.get(accountability, collection, String(item), action);
+	if (cached !== undefined) return cached;
+
+	// 5. 记录失效计数，防止竞态条件
+	const startInvalidationCount = permissionCache.getInvalidationCount();
+
+	let itemData: any = null;
+
+	try {
+		const adminService = getService(collection, { schema, knex });
+
+		// 6. 加载用户策略（与 REST API 相同的 fetchPolicies）
+		const policies = await fetchPolicies(accountability, { knex, schema });
+
+		// 7. 获取权限规则（跳过动态变量处理，后面单独处理）
+		const rawPermissions = await fetchPermissions(
+			{ 
+				action, 
+				collections: [collection], 
+				policies, 
+				accountability, 
+				bypassDynamicVariableProcessing: true 
+			},
+			{ knex, schema },
+		);
+
+		// 8. 检查是否有项级过滤规则（需要查询实际数据）
+		const hasItemRules = rawPermissions.some(
+			(p) => p.permissions && Object.keys(p.permissions).length > 0
+		);
+
+		if (hasItemRules) {
+			// 9. 解析权限中使用的动态变量
+			const dynamicVariableContext = extractRequiredDynamicVariableContextForPermissions(rawPermissions);
+
+			const permissionsContext = await fetchDynamicVariableData(
+				{ accountability, policies, dynamicVariableContext },
+				{ knex, schema },
+			);
+
+			// 10. 处理权限规则（替换动态变量值）
+			const processedPermissions = processPermissions({
+				permissions: rawPermissions,
+				accountability,
+				permissionsContext,
+			});
+
+			// 11. 确定需要查询的字段（用于评估过滤条件）
+			const fieldsToFetch = processedPermissions
+				.map((perm) => (perm.permissions ? filterToFields(perm.permissions, collection, schema) : []))
+				.flat();
+
+			// 12. 查询当前数据项（用于评估条件权限）
+			if (item && action !== 'create') {
+				try {
+					itemData = await adminService.readOne(item, {
+						fields: fieldsToFetch,
+					});
+				} catch {
+					// 数据项不存在
+					permissionCache.set(accountability, collection, String(item), action, null, []);
+					return null;
+				}
+			} else if (schema.collections[collection]?.singleton && action !== 'create') {
+				// 处理单例集合
+				itemData = await adminService.readSingleton({ fields: fieldsToFetch });
+			}
+		}
+
+		// 13. 获取允许的字段列表
+		let allowedFields: string[] = [];
+
+		if ((item || schema.collections[collection]?.singleton) && hasItemRules) {
+			// 有项级规则：使用 validateItemAccess（实际查询验证）
+			const primaryKeys: (string | number)[] = item ? [item] : [];
+
+			const validationContext = {
+				collection,
+				accountability,
+				action,
+				primaryKeys,
+				returnAllowedRootFields: true,
+			};
+
+			allowedFields = (await validateItemAccess(validationContext, { knex, schema })).allowedRootFields || [];
+		} else {
+			// 无项级规则：使用 fetchAllowedFields（仅集合级别验证）
+			allowedFields = await fetchAllowedFields({ accountability, action, collection }, { knex, schema });
+		}
+
+		// 14. 缓存结果（仅当期间无失效发生）
+		if (permissionCache.getInvalidationCount() === startInvalidationCount) {
+			// 计算 TTL 和依赖关系
+			const { ttlMs, dependencies } = calculateCacheMetadata(
+				collection,
+				itemData,
+				rawPermissions,
+				schema,
+				accountability,
+			);
+
+			permissionCache.set(
+				accountability, 
+				collection, 
+				String(item), 
+				action, 
+				allowedFields, 
+				dependencies, 
+				ttlMs
+			);
+		}
+
+		return allowedFields;
+	} catch (err) {
+		useLogger().error(
+			err,
+			`[Collab] verifyPermissions failed for user "${accountability.user}", collection "${collection}", and item "${item}"`,
+		);
+		return [];
+	}
+}
+```
+
+### 6.4 协作权限缓存机制
+
+**关键文件：** `api/src/websocket/collab/permissions-cache.ts`
+
+WebSocket 协作使用独立的权限缓存系统，与 REST API 的 `withCache` 不同：
+
+```typescript
+export class PermissionCache {
+	private cache: LRUMapWithDelete<CacheKey, string[] | null>;  // LRU 缓存
+	private tags = new Map<Tag, Set<CacheKey>>();   // 标签到缓存键的映射
+	private keyTags = new Map<CacheKey, Set<Tag>>(); // 缓存键到标签的映射
+	private timers = new Map<CacheKey, NodeJS.Timeout>(); // TTL 定时器
+	private bus = useBus();  // 消息总线（用于多实例同步）
+	private invalidationCount = 0;  // 失效计数（用于竞态条件检测）
+
+	constructor(maxSize: number) {
+		this.cache = new LRUMapWithDelete(maxSize);
+
+		// 订阅系统事件，处理缓存失效
+		this.bus.subscribe('websocket.event', (event: any) => {
+			this.handleInvalidation(event);
+		});
+	}
+
+	/**
+	 * 处理缓存失效
+	 */
+	private handleInvalidation(event: any) {
+		const { collection, keys, key } = event;
+		const items = keys || (key ? [key] : []);
+		const affectedKeys = new Set<CacheKey>();
+
+		// 系统级失效：角色、权限、策略、结构变更 → 清空全部缓存
+		if (
+			[
+				'directus_roles',
+				'directus_permissions',
+				'directus_policies',
+				'directus_access',
+				'directus_fields',
+				'directus_relations',
+				'directus_collections',
+			].includes(collection)
+		) {
+			this.clear();
+			return;
+		}
+
+		// 跳过已知高流量集合
+		if (IRRELEVANT_COLLECTIONS.includes(collection)) {
+			return;
+		}
+
+		this.invalidationCount++;
+
+		// 集合级失效
+		if (items.length === 0 && this.tags.has(`collection:${collection}`)) {
+			for (const k of this.tags.get(`collection:${collection}`)!) affectedKeys.add(k);
+		}
+
+		// 项级失效
+		for (const id of items) {
+			const tag = `item:${collection}:${id}`;
+			if (this.tags.has(tag)) {
+				for (const k of this.tags.get(tag)!) affectedKeys.add(k);
+			}
+		}
+
+		// 依赖失效（关联集合变化）
+		const depTags = [`dependency:${collection}`];
+		if (items.length > 0) {
+			for (const id of items) {
+				depTags.push(`dependency:${collection}:${id}`);
+			}
+		} else {
+			depTags.push(`collection-dependency:${collection}`);
+		}
+
+		for (const tag of depTags) {
+			if (this.tags.has(tag)) {
+				for (const k of this.tags.get(tag)!) affectedKeys.add(k);
+			}
+		}
+
+		// 执行失效
+		for (const k of affectedKeys) {
+			this.invalidateKey(k);
+		}
+	}
+
+	/**
+	 * 缓存 key 格式：user:collection:item:action
+	 */
+	private getCacheKey(
+		accountability: Accountability,
+		collection: string,
+		item: string | null,
+		action: string,
+	): CacheKey {
+		return `${accountability.user || 'public'}:${collection}:${item || 'singleton'}:${action}`;
+	}
+}
+
+// 全局单例，默认容量 2000
+export const permissionCache = new PermissionCache(
+	Number(env['WEBSOCKETS_COLLAB_PERMISSIONS_CACHE_CAPACITY'] ?? 2000)
+);
+```
+
+### 6.5 房间加入权限检查
+
+**关键文件：** `api/src/websocket/collab/collab.ts` 的 `onJoin` 方法
+
+```typescript
+async onJoin(client: WebSocketClient, message: JoinMessage) {
+	// 1. 不支持共享链接的协作编辑
+	if (client.accountability?.share) {
+		throw new ForbiddenError({
+			reason: 'Collaborative editing is not supported for shares',
+		});
+	}
+
+	const schema = await getSchema();
+	const db = getDatabase();
+
+	try {
+		// 2. 验证对目标数据项的读取权限
+		const { accessAllowed } = await validateItemAccess(
+			{
+				accountability: client.accountability!,
+				action: 'read',
+				collection: message.collection,
+				// 单例集合不需要主键
+				primaryKeys: schema.collections[message.collection]?.singleton ? [] : [message.item!],
+			},
+			{ knex: db, schema },
+		);
+
+		if (!accessAllowed) throw new ForbiddenError();
+
+		// 3. 如果有版本号，验证对版本的访问权限
+		if (message.version) {
+			const { accessAllowed: versionAccessAllowed } = await validateItemAccess(
+				{
+					accountability: client.accountability!,
+					action: 'read',
+					collection: 'directus_versions',
+					primaryKeys: [message.version],
+				},
+				{ knex: db, schema },
+			);
+
+			if (!versionAccessAllowed) throw new ForbiddenError();
+		}
+	} catch {
+		throw new ForbiddenError({
+			reason: `No permission to access item or it does not exist`,
+		});
+	}
+
+	// 4. 验证初始变更的权限
+	if (message.initialChanges) {
+		await validateChanges(
+			message.initialChanges, 
+			message.collection, 
+			message.item, 
+			{
+				knex: db,
+				schema,
+				accountability: client.accountability,
+			}
+		);
+	}
+
+	// 5. 创建房间并加入
+	const room = await this.roomManager.createRoom(
+		message.collection,
+		message.item,
+		message.version ?? null,
+		message.initialChanges,
+	);
+
+	await room.join(client, message.color);
+}
+```
+
+---
+
+## 七、三种请求方式权限校验对比
+
+### 7.1 整体对比表
+
+| 维度 | REST API | GraphQL | WebSocket 协作 |
+|------|----------|---------|----------------|
+| **认证入口** | `authenticate.ts` 中间件 | `authenticate.ts` 中间件 | `authenticateConnection()` 函数 |
+| **认证方式** | JWT / Session / Static Token | 与 REST 相同 | email/password / refresh_token / access_token |
+| **Accountability 构建** | `getAccountabilityForToken()` | 与 REST 相同 | 与 REST 相同 |
+| **权限校验核心** | `processAst()` / `validateAccess()` | 与 REST 相同 | `verifyPermissions()` |
+| **策略加载** | `fetchPolicies()` | 与 REST 相同 | `fetchPolicies()`（复用） |
+| **权限缓存** | `withCache()` 包装 | 与 REST 相同 | 独立 `PermissionCache` (LRU + 标签) |
+| **缓存失效** | 系统级 `clearSystemCache()` | 与 REST 相同 | 消息总线驱动 + 标签精确失效 |
+| **返回值** | 抛出 `ForbiddenError` | 与 REST 相同 | 返回允许的字段列表 / null |
+
+### 7.2 代码复用关系
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                          权限系统核心模块（所有入口复用）                        │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  fetchPolicies()              ← 从 directus_access 加载策略列表    │    │
+│  │  fetchPermissions()           ← 从 directus_permissions 加载规则   │    │
+│  │  fetchAllowedFields()        ← 获取允许的字段列表                   │    │
+│  │  validateItemAccess()        ← 验证项级访问权限                     │    │
+│  │  processAst()                ← 注入过滤规则到 SQL AST               │    │
+│  │  processPermissions()        ← 处理动态变量替换                      │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                                │
+└────────────────────────────────────────────────────────────────────────────────┘
+                                      ▲
+                                      │ 复用
+        ┌─────────────────────────────┼─────────────────────────────┐
+        │                             │                             │
+        ▼                             ▼                             ▼
+┌───────────────┐          ┌───────────────┐          ┌───────────────────────┐
+│  REST API     │          │  GraphQL      │          │  WebSocket 协作       │
+├───────────────┤          ├───────────────┤          ├───────────────────────┤
+│               │          │               │          │                       │
+│  入口:        │          │  入口:        │          │  入口:                │
+│  ItemsService │          │ GraphQLService│          │ CollabHandler         │
+│               │          │               │          │                       │
+│  权限检查:    │          │  权限检查:    │          │  权限检查:            │
+│  - read:      │          │  - read:      │          │  verifyPermissions()  │
+│    processAst │          │    read() →   │          │  (独立实现，复用底层) │
+│  - write:     │          │    ItemsService│          │                       │
+│    validateA- │          │  - write:     │          │  缓存:                │
+│    ccess      │          │    Resolver → │          │  PermissionCache      │
+│               │          │    ItemsService│          │  (独立 LRU + 标签)   │
+│  缓存:        │          │               │          │                       │
+│  withCache()  │          │  缓存:        │          │  通信:                │
+│  (系统级)     │          │  与 REST 相同 │          │  消息总线驱动失效     │
+│               │          │               │          │                       │
+└───────────────┘          └───────────────┘          └───────────────────────┘
+```
+
+### 7.3 关键差异点详解
+
+#### 差异 1：缓存机制
+
+| 特性 | REST/GraphQL | WebSocket 协作 |
+|------|--------------|----------------|
+| **缓存实现** | `withCache()` 装饰器 | `PermissionCache` 类 |
+| **缓存结构** | 简单 KV 存储 | LRU Map + 标签索引 |
+| **缓存 Key** | `namespace-hash(params)` | `user:collection:item:action` |
+| **失效粒度** | 系统级清空（粗粒度） | 标签精确失效（细粒度） |
+| **多实例同步** | 依赖 Redis 缓存 | 消息总线 (`websocket.event`) |
+| **竞态保护** | 无 | `invalidationCount` 计数器 |
+
+#### 差异 2：权限检查返回值
+
+**REST/GraphQL：抛出异常**
+```typescript
+// validateAccess.ts
+if (!access) {
+    throw new ForbiddenError({
+        reason: `You don't have permission to perform "${action}"...`,
+    });
+}
+```
+
+**WebSocket 协作：返回字段列表**
+```typescript
+// verifyPermissions.ts
+// 返回值含义：
+// - ['*']: 全部字段权限
+// - ['title', 'status']: 特定字段权限
+// - []: 无权限
+// - null: 数据项不存在
+return allowedFields;
+```
+
+#### 差异 3：动态变量处理时机
+
+**REST/GraphQL：在 fetchPermissions 中处理**
+```typescript
+// fetch-permissions.ts
+const processedPermissions = processPermissions({
+    permissions: rawPermissions,
+    accountability,
+    permissionsContext,
+});
+```
+
+**WebSocket 协作：在 verifyPermissions 中单独处理**
+```typescript
+// verify-permissions.ts
+// 1. 先获取原始权限（跳过动态变量处理）
+const rawPermissions = await fetchPermissions(
+    { ..., bypassDynamicVariableProcessing: true },
+    ...
+);
+
+// 2. 检查是否需要项级数据
+const hasItemRules = rawPermissions.some(
+    (p) => p.permissions && Object.keys(p.permissions).length > 0
+);
+
+// 3. 有项级规则时才查询数据并处理动态变量
+if (hasItemRules) {
+    const dynamicVariableContext = extractRequiredDynamicVariableContextForPermissions(rawPermissions);
+    const permissionsContext = await fetchDynamicVariableData(...);
+    const processedPermissions = processPermissions({...});
+    // ... 查询数据项 ...
+}
+```
+
+---
+
+## 八、总结
+
+### 8.1 权限系统核心流程总览
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                         Directus 权限系统完整执行流程                            │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  【配置阶段】                                                                   │
+│                                                                                │
+│  Admin UI → REST API → AccessService/PermissionsService → Database          │
+│     │              │                │                          │              │
+│     ▼              ▼                ▼                          ▼              │
+│  角色/策略    directus_access   清除系统缓存          directus_roles         │
+│  权限配置     directus_permissions              directus_policies           │
+│                                          directus_access             │
+│                                          directus_permissions              │
+│                                                                                │
+│  ============================================================================ │
+│                                                                                │
+│  【运行阶段】                                                                   │
+│                                                                                │
+│  请求到达（HTTP / WebSocket）                                                  │
+│         │                                                                      │
+│         ▼                                                                      │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  1. 认证（三种入口，同一构建逻辑）                                    │    │
+│  │                                                                       │    │
+│  │  REST:     authenticate 中间件 → getAccountabilityForToken()       │    │
+│  │  GraphQL:  authenticate 中间件 → getAccountabilityForToken()       │    │
+│  │  WebSocket: authenticateConnection() → getAccountabilityForToken() │    │
+│  │                                                                       │    │
+│  │  产出: accountability = { user, role, roles, admin, app, ip }      │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│         │                                                                      │
+│         ▼                                                                      │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  2. 策略加载（所有入口复用 fetchPolicies）                           │    │
+│  │                                                                       │    │
+│  │  fetchPolicies(accountability, context)                             │    │
+│  │    │                                                                  │    │
+│  │    ├── 1. 构建过滤条件                                               │    │
+│  │    │    - 有角色: role IN (roles 树)                               │    │
+│  │    │    - 有用户: OR user = current_user                            │    │
+│  │    │    - 无角色: role IS NULL (Public)                             │    │
+│  │    │                                                                  │    │
+│  │    ├── 2. 查询 directus_access + directus_policies                 │    │
+│  │    │                                                                  │    │
+│  │    ├── 3. IP 过滤 (filterPoliciesByIp)                               │    │
+│  │    │                                                                  │    │
+│  │    ├── 4. 优先级排序                                                 │    │
+│  │    │    父角色 < 子角色 < 用户策略                                   │    │
+│  │    │                                                                  │    │
+│  │    └── 5. 缓存 (withCache 或 PermissionCache)                       │    │
+│  │                                                                       │    │
+│  │  产出: string[] - 策略 ID 列表                                       │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│         │                                                                      │
+│         ▼                                                                      │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  3. 权限规则获取与处理                                               │    │
+│  │                                                                       │    │
+│  │  fetchPermissions({ action, policies, collections, accountability })│    │
+│  │    │                                                                  │    │
+│  │    ├── 1. 查询 directus_permissions                                 │    │
+│  │    │    WHERE policy IN (policies)                                  │    │
+│  │    │      AND collection IN (collections)                           │    │
+│  │    │      AND action = action                                        │    │
+│  │    │                                                                  │    │
+│  │    ├── 2. 动态变量替换                                               │    │
+│  │    │    $CURRENT_USER → accountability.user                         │    │
+│  │    │    $CURRENT_ROLE → accountability.role                         │    │
+│  │    │    $NOW → 当前时间戳                                            │    │
+│  │    │                                                                  │    │
+│  │    └── 3. OR 合并多个策略的权限                                      │    │
+│  │                                                                       │    │
+│  │  产出: Permission[] - 权限规则列表                                   │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│         │                                                                      │
+│         ▼                                                                      │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  4. 权限执行（三种入口差异）                                         │    │
+│  │                                                                       │    │
+│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐│    │
+│  │  │   REST/GraphQL  │  │   REST/GraphQL  │  │   WebSocket 协作    ││    │
+│  │  │   (读取操作)     │  │   (写入操作)     │  │                     ││    │
+│  │  ├─────────────────┤  ├─────────────────┤  ├─────────────────────┤│    │
+│  │  │                 │  │                 │  │                     ││    │
+│  │  │ processAst()    │  │ validateAccess()│  │ verifyPermissions() ││    │
+│  │  │                 │  │                 │  │                     ││    │
+│  │  │ 注入过滤规则到   │  │ 实际查询数据库  │  │ 返回允许的字段列表  ││    │
+│  │  │ SQL AST         │  │ 验证权限        │  │                     ││    │
+│  │  │                 │  │                 │  │ 用于:               ││    │
+│  │  │ 适用:            │  │ 适用:            │  │ - 房间加入         ││    │
+│  │  │ - readByQuery    │  │ - create/update │  │ - 字段更新         ││    │
+│  │  │ - readOne        │  │ - delete        │  │ - 聚焦/取消聚焦    ││    │
+│  │  │ - readSingleton  │  │                 │  │ - 丢弃变更         ││    │
+│  │  │                 │  │                 │  │                     ││    │
+│  │  └─────────────────┘  └─────────────────┘  └─────────────────────┘│    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                                │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 关键代码位置速查表
+
+| 功能模块 | 文件路径 | 关键函数/类 |
+|----------|----------|-------------|
+| **策略加载** | `api/src/permissions/lib/fetch-policies.ts` | `fetchPolicies`, `_fetchPolicies` |
+| **权限加载** | `api/src/permissions/lib/fetch-permissions.ts` | `fetchPermissions` |
+| **读取权限注入** | `api/src/permissions/modules/process-ast/process-ast.ts` | `processAst`, `injectCases` |
+| **写入权限验证** | `api/src/permissions/modules/validate-access/validate-access.ts` | `validateAccess`, `validateItemAccess` |
+| **权限合并** | `api/src/permissions/utils/merge-permissions.ts` | `mergePermissions` |
+| **IP 过滤** | `api/src/permissions/utils/filter-policies-by-ip.ts` | `filterPoliciesByIp` |
+| **动态变量处理** | `api/src/permissions/utils/process-permissions.ts` | `processPermissions` |
+| **REST 缓存** | `api/src/permissions/utils/with-cache.ts` | `withCache` |
+| **Accountability 构建** | `api/src/utils/get-accountability-for-token.ts` | `getAccountabilityForToken` |
+| **角色树加载** | `api/src/utils/fetch-roles-tree.ts` | `fetchRolesTree` |
+| **GraphQL 服务** | `api/src/services/graphql/index.ts` | `GraphQLService` |
+| **GraphQL 控制器** | `api/src/controllers/graphql.ts` | 路由定义 |
+| **WebSocket 认证** | `api/src/websocket/authenticate.ts` | `authenticateConnection` |
+| **协作权限校验** | `api/src/websocket/collab/verify-permissions.ts` | `verifyPermissions` |
+| **协作权限缓存** | `api/src/websocket/collab/permissions-cache.ts` | `PermissionCache` |
+| **协作处理器** | `api/src/websocket/collab/collab.ts` | `CollabHandler` |
+| **协作房间** | `api/src/websocket/collab/room.ts` | `Room`, `RoomManager` |
+| **Access 服务** | `api/src/services/access.ts` | `AccessService` |
+| **权限服务** | `api/src/services/permissions.ts` | `PermissionsService` |
+| **角色服务** | `api/src/services/roles.ts` | `RolesService` |
+
+### 8.3 核心设计思想
+
+1. **三层权限模型（v11 引入）**
+   - 角色 → 策略 → 权限规则
+   - 通过 `directus_access` 关联表实现灵活绑定
+   - 支持角色继承、用户级策略覆盖
+
+2. **OR 权限合并策略**
+   - 多个策略的权限规则使用 OR 逻辑合并
+   - 任意一个策略允许的字段/条件，用户就有权访问
+   - 优先级：用户策略 > 子角色 > 父角色
+
+3. **动态变量支持**
+   - `$CURRENT_USER`, `$CURRENT_ROLE`, `$NOW` 等
+   - 在权限检查时动态替换为实际值
+   - 支持基于数据状态的条件权限
+
+4. **缓存分层设计**
+   - REST/GraphQL：系统级缓存，简单高效
+   - WebSocket 协作：独立 LRU 缓存 + 标签精确失效
+   - 多实例通过消息总线同步失效事件
+
+5. **代码复用最大化**
+   - `fetchPolicies`, `fetchPermissions`, `validateItemAccess` 等核心函数所有入口复用
+   - 三种请求方式的差异仅在最上层封装
+   - 降低维护成本，确保行为一致性
+
+### 3.2 fetchPolicies 核心实现
+
+**关键文件：** `api/src/permissions/lib/fetch-policies.ts`
+
+```typescript
+export interface AccessRow {
+  policy: { id: string; ip_access: string[] | null };
+  role: string | null;
+}
+
+// 使用缓存包装器
+export const fetchPolicies = withCache(
+  'policies', 
+  _fetchPolicies, 
+  ({ roles, user, ip }) => ({ roles, user, ip })  // 缓存 key 的参数
+);
+
+/**
+ * Fetch the policies associated with the current user accountability
+ */
+export async function _fetchPolicies(
+  { roles, user, ip }: Pick<Accountability, 'user' | 'roles' | 'ip'>,
+  context: Context,
+): Promise<string[]> {
+  const { AccessService } = await import('../../services/access.js');
+  const accessService = new AccessService(context);
+
+  let roleFilter: Filter;
+
+  // 1. 构建角色过滤条件
+  if (roles.length === 0) {
+    // 无角色用户使用 Public 角色权限
+    roleFilter = { _and: [{ role: { _null: true } }, { user: { _null: true } }] };
+  } else {
+    // 有角色用户：过滤角色树中的所有角色
+    roleFilter = { role: { _in: roles } };
+  }
+
+  // 2. 如果有用户，还需包含用户级策略
+  const filter = user ? { _or: [{ user: { _eq: user } }, roleFilter] } : roleFilter;
+
+  // 3. 查询 directus_access 表，关联获取策略信息
+  const accessRows = (await accessService.readByQuery({
+    filter,
+    fields: ['policy.id', 'policy.ip_access', 'role'],  // 同时获取策略的 IP 限制
+    limit: -1,
+  })) as AccessRow[];
+
+  // 4. IP 地址过滤
+  const filteredAccessRows = filterPoliciesByIp(accessRows, ip);
+
+  /*
+   * 5. 按优先级排序 (从低到高):
+   * - 父角色策略 (roles 数组中索引较小的)
+   * - 子角色策略 (roles 数组中索引较大的)
+   * - 用户策略 (role 为 null 但 user 有值)
+   */
+  filteredAccessRows.sort((a, b) => {
+    if (!a.role && !b.role) return 0;    // 都是用户策略：顺序不变
+    if (!a.role) return 1;                 // a 是用户策略：排后面（高优先级）
+    if (!b.role) return -1;                // b 是用户策略：b 排后面
+
+    // 基于 roles 数组的索引顺序（父角色在前，子角色在后）
+    return roles.indexOf(a.role) - roles.indexOf(b.role);
+  });
+
+  // 6. 提取策略 ID 列表
+  const ids = filteredAccessRows.map(({ policy }) => policy.id);
+
+  return ids;
+}
+```
+
+### 3.3 IP 过滤机制
+
+**关键文件：** `api/src/permissions/utils/filter-policies-by-ip.ts`
+
+```typescript
+export function filterPoliciesByIp(
+  policies: AccessRow[], 
+  ip: string | null | undefined
+) {
+  return policies.filter(({ policy }) => {
+    // 1. 没有配置 IP 白名单的策略：始终保留
+    if (!policy.ip_access || policy.ip_access.length === 0) {
+      return true;
+    }
+
+    // 2. 配置了 IP 白名单但无法获取客户端 IP：安全起见，拒绝访问
+    if (!ip) {
+      return false;
+    }
+
+    // 3. 检查 IP 是否在允许列表中（支持 CIDR 格式）
+    return ipInNetworks(ip, policy.ip_access);
+  });
+}
+```
+
+### 3.4 缓存机制
+
+**关键文件：** `api/src/permissions/utils/with-cache.ts`
+
+```typescript
+export function withCache<F extends (...args: any) => any>(
+  namespace: string,
+  handler: F,
+  prepareArg?: (...args: Parameters<F>) => Record<string, unknown>,
+): (...args: Parameters<F>) => Promise<Awaited<ReturnType<F>>> {
+  const cache = useCache();
+
+  return async (...args) => {
+    // 1. 准备缓存 key 参数
+    const hashArgs = prepareArg ? prepareArg(...args) : args;
+    
+    // 2. 生成缓存 key：namespace + hash(参数)
+    const key = namespace + '-' + getSimpleHash(JSON.stringify(hashArgs));
+    
+    // 3. 尝试从缓存获取
+    const cached = await cache.get(key);
+
+    if (cached !== undefined) {
+      return cached as Awaited<ReturnType<F>>;
+    }
+
+    // 4. 缓存未命中，执行实际查询
+    const res = await handler(...args);
+
+    // 5. 存入缓存
+    cache.set(key, res);
+
+    return res;
+  };
+}
+```
+
+### 3.5 缓存清除触发点
+
+策略缓存会在以下情况被清除：
+
+| 触发点 | 服务/文件 | 说明 |
+|--------|----------|------|
+| 策略关联创建 | `AccessService.createOne` | 新绑定角色-策略 |
+| 策略关联更新 | `AccessService.updateMany` | 修改策略绑定 |
+| 策略关联删除 | `AccessService.deleteMany` | 解除策略绑定 |
+| 角色父级变更 | `RolesService.updateMany` | 角色继承关系变化 |
+| 角色删除 | `RolesService.deleteMany` | 级联清理策略关联 |
+| 权限规则变更 | `PermissionsService.*` | 权限规则增删改 |
+
+### 3.6 权限合并策略
+
+当多个策略都有权限规则时，Directus 使用 OR 逻辑合并：
+
+**关键文件：** `api/src/permissions/utils/merge-permissions.ts`
+
+```typescript
+// 权限合并规则（OR 逻辑）：
+// 1. 多个策略中任意一个允许的字段，用户就有权访问
+// 2. 多个策略的过滤条件使用 OR 合并
+// 3. 优先级：用户策略 > 子角色策略 > 父角色策略
+
+// 示例场景：
+// 策略 A（父角色）：
+//   - 允许读取 articles 集合的 title, status 字段
+//   - 过滤条件：status = 'published'
+//
+// 策略 B（子角色）：
+//   - 允许读取 articles 集合的 content, author 字段
+//   - 过滤条件：author = $CURRENT_USER
+//
+// 合并后权限：
+//   - 允许字段：title, status, content, author（OR 合并）
+//   - 过滤条件：(status = 'published') OR (author = $CURRENT_USER)
+```
+
+---
+
+## 四、权限执行链路（请求到达 → 权限验证 → 数据访问）
+
+### 4.1 请求处理流程图
 
 ```
                     HTTP 请求到达
@@ -352,6 +1372,7 @@ export type Permission = {
 │  - POST   /items/:collection     → 创建数据                                │
 │  - PATCH  /items/:collection/:id → 更新数据                                │
 │  - DELETE /items/:collection/:id → 删除数据                                │
+│  - POST   /graphql              → GraphQL 查询                             │
 └──────────────────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -372,7 +1393,7 @@ export type Permission = {
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 认证与 Accountability 构建
+### 4.2 认证与 Accountability 构建
 
 **关键文件：** `api/src/middleware/authenticate.ts`
 
@@ -459,7 +1480,7 @@ export async function getAccountabilityForToken(
 }
 ```
 
-### 3.3 读取操作权限处理
+### 4.3 读取操作权限处理
 
 **关键文件：** `api/src/services/items.ts:readByQuery`
 
@@ -491,7 +1512,7 @@ async readByQuery(query: Query, opts?: QueryOptions): Promise<Item[]> {
 }
 ```
 
-### 3.4 processAst - 权限注入核心
+### 4.4 processAst - 权限注入核心
 
 **关键文件：** `api/src/permissions/modules/process-ast/process-ast.ts`
 
@@ -549,7 +1570,7 @@ export async function processAst(options: ProcessAstOptions, context: Context) {
 }
 ```
 
-### 3.5 injectCases - 过滤规则注入
+### 4.5 injectCases - 过滤规则注入
 
 **关键文件：** `api/src/permissions/modules/process-ast/lib/inject-cases.ts`
 
@@ -593,7 +1614,7 @@ function processChildren(
 }
 ```
 
-### 3.6 getCases - 构建过滤规则
+### 4.6 getCases - 构建过滤规则
 
 **关键文件：** `api/src/permissions/modules/process-ast/lib/get-cases.ts`
 
@@ -641,7 +1662,7 @@ export function getCases(collection: string, permissions: Permission[], requeste
 }
 ```
 
-### 3.7 写入操作权限验证
+### 4.7 写入操作权限验证
 
 **关键文件：** `api/src/services/items.ts:updateMany`
 
@@ -694,7 +1715,7 @@ async updateMany(keys: PrimaryKey[], data: Partial<Item>, opts: MutationOptions 
 }
 ```
 
-### 3.8 validateAccess - 访问验证
+### 4.8 validateAccess - 访问验证
 
 **关键文件：** `api/src/permissions/modules/validate-access/validate-access.ts`
 
@@ -743,7 +1764,7 @@ export async function validateAccess(options: ValidateAccessOptions, context: Co
 }
 ```
 
-### 3.9 validateItemAccess - 项级权限验证
+### 4.9 validateItemAccess - 项级权限验证
 
 **关键文件：** `api/src/permissions/modules/validate-access/lib/validate-item-access.ts`
 
@@ -810,235 +1831,509 @@ export async function validateItemAccess(
 
 ---
 
-## 四、权限缓存机制
+## 五、GraphQL 请求权限校验链路
 
-### 4.1 缓存配置
-
-**关键文件：** `api/src/permissions/cache.ts`
-
-```typescript
-const localOnly = redisConfigAvailable() === false;
-const env = useEnv();
-const ttl = getMilliseconds(env['CACHE_SYSTEM_TTL']);
-
-// 根据是否有 Redis 选择缓存策略
-const config: CacheConfig = localOnly
-  ? {
-      type: 'local',
-      maxKeys: 500,
-    }
-  : {
-      type: 'multi',
-      redis: {
-        namespace: (env['REDIS_PERMISSIONS_NAMESPACE'] as string) ?? 'permissions',
-        redis: useRedis(),
-        ...(ttl !== undefined ? { ttl } : {}),
-      },
-      local: {
-        maxKeys: 100,
-      },
-    };
-
-export const useCache = defineCache(config);
-
-export function clearCache() {
-  const cache = useCache();
-  return cache.clear();
-}
-```
-
-### 4.2 缓存清除时机
-
-权限缓存会在以下情况被清除：
-
-1. **权限规则变更时** (`PermissionsService`)
-   ```typescript
-   // api/src/services/permissions.ts
-   private async clearCaches(opts?: MutationOptions) {
-     await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
-     
-     if (this.cache && opts?.autoPurgeCache !== false) {
-       await this.cache.clear();
-     }
-   }
-   ```
-
-2. **角色变更时** (`RolesService`)
-   ```typescript
-   // api/src/services/roles.ts
-   override async updateMany(keys: PrimaryKey[], data: Partial<Item>, opts: MutationOptions = {}) {
-     if ('parent' in data) {
-       // 父角色变更时清除缓存
-       await this.clearCaches();
-     }
-     // ...
-   }
-   ```
-
----
-
-## 五、动态变量解析
-
-权限规则中支持使用动态变量，如 `$CURRENT_USER`、`$CURRENT_ROLE` 等。
-
-### 5.1 动态变量处理流程
-
-**关键文件：** `api/src/permissions/lib/fetch-permissions.ts`
-
-```typescript
-export async function fetchPermissions(options: FetchPermissionsOptions, context: Context) {
-  // 1. 获取原始权限（包含动态变量占位符）
-  const permissions = await fetchRawPermissions(
-    { ...options, bypassMinimalAppPermissions: options.bypassDynamicVariableProcessing ?? false },
-    context,
-  );
-
-  // 2. 处理动态变量
-  if (options.accountability && !options.bypassDynamicVariableProcessing) {
-    // 提取需要的动态变量上下文
-    const dynamicVariableContext = extractRequiredDynamicVariableContextForPermissions(permissions);
-
-    // 获取动态变量的实际值
-    const permissionsContext = await fetchDynamicVariableData(
-      {
-        accountability: options.accountability,
-        policies: options.policies,
-        dynamicVariableContext,
-      },
-      context,
-    );
-
-    // 替换动态变量为实际值
-    const processedPermissions = processPermissions({
-      permissions,
-      accountability: options.accountability,
-      permissionsContext,
-    });
-
-    return processedPermissions;
-  }
-
-  return permissions;
-}
-```
-
-### 5.2 常用动态变量
-
-| 变量 | 说明 | 示例 |
-|------|------|------|
-| `$CURRENT_USER` | 当前用户 ID | `{ "owner": { "_eq": "$CURRENT_USER" } }` |
-| `$CURRENT_ROLE` | 当前角色 ID | `{ "role": { "_eq": "$CURRENT_ROLE" } }` |
-| `$CURRENT_TIMESTAMP` | 当前时间戳 | `{ "created_at": { "_lte": "$CURRENT_TIMESTAMP" } }` |
-| `$NOW` | 当前日期时间 | 同上 |
-| `$FOLLOW` | 关联字段引用 | 用于嵌套过滤 |
-
----
-
-## 六、关键代码位置速查表
-
-| 功能 | 文件路径 |
-|------|----------|
-| 角色管理页面 | `app/src/modules/settings/routes/roles/item.vue` |
-| 权限 API 控制器 | `api/src/controllers/permissions.ts` |
-| 角色 API 控制器 | `api/src/controllers/roles.ts` |
-| 权限服务 | `api/src/services/permissions.ts` |
-| 角色服务 | `api/src/services/roles.ts` |
-| 认证中间件 | `api/src/middleware/authenticate.ts` |
-| Accountability 构建 | `api/src/utils/get-accountability-for-token.ts` |
-| AST 权限处理 | `api/src/permissions/modules/process-ast/process-ast.ts` |
-| 访问验证 | `api/src/permissions/modules/validate-access/validate-access.ts` |
-| 项级验证 | `api/src/permissions/modules/validate-access/lib/validate-item-access.ts` |
-| 过滤规则注入 | `api/src/permissions/modules/process-ast/lib/inject-cases.ts` |
-| 权限获取 | `api/src/permissions/lib/fetch-permissions.ts` |
-| 权限缓存 | `api/src/permissions/cache.ts` |
-| 权限类型定义 | `packages/types/src/permissions.ts` |
-| 策略迁移 | `api/src/database/migrations/20240806A-permissions-policies.ts` |
-
----
-
-## 七、执行流程图总结
+### 5.1 整体流程概览
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────┐
-│                        一次 API 请求的权限检查完整流程                            │
+│                        GraphQL 请求权限校验完整流程                                │
 ├────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                │
-│  1. 请求到达                                                                   │
+│  1. HTTP 请求到达                                                              │
+│     POST /graphql 或 POST /graphql/system                                    │
 │     │                                                                         │
 │     ▼                                                                         │
-│  2. authenticate.ts (认证中间件)                                              │
-│     ├── 解析 JWT Token / Session Cookie                                       │
-│     └── 调用 getAccountabilityForToken()                                      │
-│         │                                                                     │
-│         ├── fetchRolesTree() → 获取角色继承树                                │
-│         └── fetchGlobalAccess() → 获取 admin/app 权限                       │
+│  2. 认证中间件 (authenticate.ts)                                              │
+│     - 与 REST API 完全相同的认证流程                                          │
+│     - 构建 req.accountability 对象                                            │
 │     │                                                                         │
 │     ▼                                                                         │
-│  3. accountability 对象构建完成                                               │
-│     { user, role, roles, admin, app, ip, ... }                              │
+│  3. GraphQL 路由 (graphql.ts)                                                 │
+│     ┌────────────────────────────────────────────────────────────────────┐  │
+│     │  router.use(                                                         │  │
+│     │    '/',                                                              │  │
+│     │    parseGraphQL,        // 解析 GraphQL 查询文档                   │  │
+│     │    asyncHandler(async (req, res, next) => {                        │  │
+│     │      const service = new GraphQLService({                           │  │
+│     │        accountability: req.accountability,  // 传递 accountability  │  │
+│     │        schema: req.schema,                                          │  │
+│     │        scope: 'items',              // 或 'system'                 │  │
+│     │      });                                                             │  │
+│     │                                                                      │  │
+│     │      res.locals['payload'] = await service.execute(                │  │
+│     │        res.locals['graphqlParams']  // 解析后的查询参数            │  │
+│     │      );                                                              │  │
+│     │    }),                                                               │  │
+│     │    respond,                                                          │  │
+│     │  );                                                                  │  │
+│     └────────────────────────────────────────────────────────────────────┘  │
 │     │                                                                         │
 │     ▼                                                                         │
-│  4. 路由分发到 ItemsService                                                   │
+│  4. GraphQLService.execute()                                                 │
+│     ┌────────────────────────────────────────────────────────────────────┐  │
+│     │  async execute({ document, variables, operationName, contextValue }) │  │
+│     │  {                                                                   │  │
+│     │    const schema = await this.getSchema();  // 生成 GraphQL Schema   │  │
+│     │                                                                      │  │
+│     │    // 1. 验证 GraphQL 查询文档                                       │  │
+│     │    const validationErrors = validate(schema, document, rules);    │  │
+│     │                                                                      │  │
+│     │    // 2. 执行查询                                                    │  │
+│     │    result = await execute({                                         │  │
+│     │      schema,                                                        │  │
+│     │      document,                                                      │  │
+│     │      contextValue,                                                  │  │
+│     │      variableValues: variables,                                    │  │
+│     │      operationName,                                                 │  │
+│     │    });                                                               │  │
+│     │  }                                                                   │  │
+│     └────────────────────────────────────────────────────────────────────┘  │
 │     │                                                                         │
-│     ├── 读取操作 (GET)                                                        │
-│     │   ├── getAstFromQuery() → 构建查询 AST                                │
-│     │   ├── processAst() → 权限注入 [核心]                                  │
-│     │   │   ├── fetchPolicies() → 获取关联策略                              │
-│     │   │   ├── fetchPermissions() → 获取权限规则                            │
-│     │   │   ├── validatePathPermissions() → 验证字段权限                     │
-│     │   │   └── injectCases() → 注入过滤规则到 AST                          │
-│     │   └── runAst() → 执行带权限的 SQL 查询                                │
+│     ▼                                                                         │
+│  5. Resolver 执行 (resolveQuery / resolveMutation)                          │
+│     ┌────────────────────────────────────────────────────────────────────┐  │
+│     │  // 查询解析器                                                        │  │
+│     │  async function resolveQuery(gql: GraphQLService, info) {          │  │
+│     │    // 1. 解析 GraphQL 参数为 Directus Query                          │  │
+│     │    const query = await getQuery(args, gql.schema, selections, ...); │  │
+│     │                                                                      │  │
+│     │    // 2. 调用 GraphQLService.read()                                  │  │
+│     │    const result = await gql.read(collection, query, args['id']);   │  │
+│     │  }                                                                   │  │
+│     │                                                                      │  │
+│     │  // 变更解析器                                                        │  │
+│     │  async function resolveMutation(gql, args, info) {                  │  │
+│     │    const action = info.fieldName.split('_')[0]; // create/update/delete│
+│     │    const service = getService(collection, {                         │  │
+│     │      knex: gql.knex,                                                 │  │
+│     │      accountability: gql.accountability,  // 传递 accountability    │  │
+│     │      schema: gql.schema,                                             │  │
+│     │    });                                                               │  │
+│     │                                                                      │  │
+│     │    // 直接调用 ItemsService 方法                                      │  │
+│     │    if (action === 'create') await service.createOne(args['data']);  │  │
+│     │    if (action === 'update') await service.updateOne(args['id'], ...);│  │
+│     │    if (action === 'delete') await service.deleteOne(args['id']);    │  │
+│     │  }                                                                   │  │
+│     └────────────────────────────────────────────────────────────────────┘  │
 │     │                                                                         │
-│     └── 写入操作 (POST/PATCH/DELETE)                                          │
-│         ├── validateAccess() → 权限验证 [核心]                               │
-│         │   └── validateItemAccess()                                         │
-│         │       ├── processAst() → 注入权限规则                             │
-│         │       └── fetchPermittedAstRootFields() → 实际查询验证            │
-│         ├── processPayload() → 处理预设值和验证规则                          │
-│         └── 执行 SQL 写入                                                     │
+│     ▼                                                                         │
+│  6. 复用 REST API 权限校验                                                   │
+│     - GraphQLService.read() → ItemsService.readByQuery/readOne             │
+│     - Resolver 直接调用 ItemsService.createOne/updateOne/deleteOne          │
+│     - 所有权限检查逻辑与 REST API 完全一致                                   │
+│       ├── processAst() → 注入权限过滤规则                                   │
+│       ├── validateAccess() → 验证访问权限                                   │
+│       └── fetchPolicies() → 加载策略列表                                   │
 │                                                                                │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 5.2 GraphQL 控制器
+
+**关键文件：** `api/src/controllers/graphql.ts`
+
+```typescript
+import { Router } from 'express';
+import { parseGraphQL } from '../middleware/graphql.js';
+import { respond } from '../middleware/respond.js';
+import { GraphQLService } from '../services/graphql/index.js';
+import asyncHandler from '../utils/async-handler.js';
+
+const router = Router();
+
+// 系统集合 GraphQL 端点
+router.use(
+  '/system',
+  parseGraphQL,
+  asyncHandler(async (req, res, next) => {
+    const service = new GraphQLService({
+      accountability: req.accountability,  // 从认证中间件传递
+      schema: req.schema,
+      scope: 'system',
+    });
+
+    res.locals['payload'] = await service.execute(res.locals['graphqlParams']);
+
+    if (res.locals['payload']?.errors?.length > 0) {
+      res.locals['cache'] = false;
+    }
+
+    return next();
+  }),
+  respond,
+);
+
+// 用户集合 GraphQL 端点
+router.use(
+  '/',
+  parseGraphQL,
+  asyncHandler(async (req, res, next) => {
+    const service = new GraphQLService({
+      accountability: req.accountability,  // 传递 accountability
+      schema: req.schema,
+      scope: 'items',
+    });
+
+    res.locals['payload'] = await service.execute(res.locals['graphqlParams']);
+
+    if (res.locals['payload']?.errors?.length > 0) {
+      res.locals['cache'] = false;
+    }
+
+    return next();
+  }),
+  respond,
+);
+
+export default router;
+```
+
+### 5.3 GraphQLService 核心实现
+
+**关键文件：** `api/src/services/graphql/index.ts`
+
+```typescript
+export class GraphQLService {
+  accountability: Accountability | null;  // 保存 accountability
+  knex: Knex;
+  schema: SchemaOverview;
+  scope: GQLScope;
+
+  constructor(options: AbstractServiceOptions & { scope: GQLScope }) {
+    this.accountability = options?.accountability || null;  // 存储
+    this.knex = options?.knex || getDatabase();
+    this.schema = options.schema;
+    this.scope = options.scope;
+  }
+
+  /**
+   * Execute a GraphQL structure
+   */
+  async execute({
+    document,
+    variables,
+    operationName,
+    contextValue,
+  }: GraphQLParams): Promise<FormattedExecutionResult> {
+    const schema = await this.getSchema();
+
+    // 验证 GraphQL 查询
+    const validationErrors = validate(schema, document, validationRules).map((validationError) =>
+      addPathToValidationError(validationError),
+    );
+
+    if (validationErrors.length > 0) {
+      throw new GraphQLValidationError({ errors: validationErrors });
+    }
+
+    // 执行 GraphQL 查询
+    let result: ExecutionResult;
+    try {
+      result = await execute({
+        schema,
+        document,
+        contextValue,
+        variableValues: variables,
+        operationName,
+      });
+    } catch (err: any) {
+      throw new GraphQLExecutionError({ errors: [err.message] });
+    }
+
+    // 格式化结果
+    const formattedResult: FormattedExecutionResult = {};
+    if (result['data']) formattedResult.data = result['data'];
+    if (result['errors']) {
+      formattedResult.errors = result['errors'].map((error) => 
+        processError(this.accountability, error)
+      );
+    }
+
+    return formattedResult;
+  }
+
+  /**
+   * 读取操作 - 委托给 ItemsService
+   */
+  async read(collection: string, query: Query, id?: PrimaryKey): Promise<Partial<Item>> {
+    const service = getService(collection, {
+      knex: this.knex,
+      accountability: this.accountability,  // 传递 accountability
+      schema: this.schema,
+    });
+
+    if (this.schema.collections[collection]!.singleton)
+      return await service.readSingleton(query, { stripNonRequested: false });
+
+    if (id) return await service.readOne(id, query, { stripNonRequested: false });
+
+    return await service.readByQuery(query, { stripNonRequested: false });
+  }
+
+  /**
+   * 单例更新操作
+   */
+  async upsertSingleton(
+    collection: string,
+    body: Record<string, any> | Record<string, any>[],
+    query: Query,
+  ): Promise<Partial<Item> | boolean> {
+    const service = getService(collection, {
+      knex: this.knex,
+      accountability: this.accountability,  // 传递 accountability
+      schema: this.schema,
+    });
+
+    try {
+      await service.upsertSingleton(body);
+
+      if ((query.fields || []).length > 0) {
+        const result = await service.readSingleton(query);
+        return result;
+      }
+
+      return true;
+    } catch (err: any) {
+      throw formatError(err);
+    }
+  }
+}
+```
+
+### 5.4 查询解析器
+
+**关键文件：** `api/src/services/graphql/resolvers/query.ts`
+
+```typescript
+export async function resolveQuery(gql: GraphQLService, info: GraphQLResolveInfo): Promise<Partial<Item> | null> {
+  let collection = info.fieldName;
+  if (gql.scope === 'system') collection = `directus_${collection}`;
+  
+  const selections = replaceFragmentsInSelections(
+    info.fieldNodes[0]?.selectionSet?.selections, 
+    info.fragments
+  );
+
+  if (!selections) return null;
+  
+  // 解析 GraphQL 参数
+  const args: Record<string, any> = parseArgs(
+    info.fieldNodes[0]!.arguments || [], 
+    info.variableValues
+  );
+
+  let query: Query;
+  const isAggregate = collection.endsWith('_aggregated') && 
+    collection in gql.schema.collections === false;
+
+  if (isAggregate) {
+    // 聚合查询
+    collection = collection.slice(0, -11);
+    query = await getAggregateQuery(args, selections, gql.schema, gql.accountability, collection);
+  } else {
+    // 普通查询
+    if (collection.endsWith('_by_id') && collection in gql.schema.collections === false) {
+      collection = collection.slice(0, -6);
+    }
+
+    // 构建 Directus Query 对象
+    query = await getQuery(args, gql.schema, selections, info.variableValues, gql.accountability, collection);
+
+    if (collection.endsWith('_by_version') && collection in gql.schema.collections === false) {
+      collection = collection.slice(0, -11);
+      query.versionRaw = true;
+    }
+  }
+
+  // 调用 GraphQLService.read()，最终委托给 ItemsService
+  const result = await gql.read(collection, query, args['id']);
+
+  if (args['id']) return result;
+
+  // 处理分组查询
+  if (query.group) {
+    const aggregateKeys = Object.keys(query.aggregate ?? {});
+    result['map']((payload: Item) => {
+      payload['group'] = omit(payload, aggregateKeys);
+    });
+  }
+
+  return result;
+}
+```
+
+### 5.5 变更解析器
+
+**关键文件：** `api/src/services/graphql/resolvers/mutation.ts`
+
+```typescript
+export async function resolveMutation(
+  gql: GraphQLService,
+  args: Record<string, any>,
+  info: GraphQLResolveInfo,
+): Promise<Partial<Item> | boolean | undefined> {
+  // 从字段名解析操作类型和集合
+  const action = info.fieldName.split('_')[0] as 'create' | 'update' | 'delete';
+  let collection = info.fieldName.substring(action.length + 1);
+  if (gql.scope === 'system') collection = `directus_${collection}`;
+
+  const selections = replaceFragmentsInSelections(
+    info.fieldNodes[0]?.selectionSet?.selections, 
+    info.fragments
+  );
+  
+  // 构建查询（用于读取返回数据）
+  const query = await getQuery(
+    args, gql.schema, selections || [], info.variableValues, gql.accountability, collection
+  );
+
+  // 判断操作类型
+  const singleton =
+    collection.endsWith('_batch') === false &&
+    collection.endsWith('_items') === false &&
+    collection.endsWith('_item') === false &&
+    collection in gql.schema.collections;
+
+  const single = collection.endsWith('_items') === false && collection.endsWith('_batch') === false;
+  const batchUpdate = action === 'update' && collection.endsWith('_batch');
+
+  // 清理集合名称
+  if (collection.endsWith('_batch')) collection = collection.slice(0, -6);
+  if (collection.endsWith('_items')) collection = collection.slice(0, -6);
+  if (collection.endsWith('_item')) collection = collection.slice(0, -5);
+
+  // 单例更新
+  if (singleton && action === 'update') {
+    return await gql.upsertSingleton(collection, args['data'], query);
+  }
+
+  // 获取 ItemsService（会传递 accountability）
+  const service = getService(collection, {
+    knex: gql.knex,
+    accountability: gql.accountability,  // 关键：传递 accountability
+    schema: gql.schema,
+  });
+
+  const hasQuery = (query.fields || []).length > 0;
+
+  try {
+    if (single) {
+      // 单条操作
+      if (action === 'create') {
+        const key = await service.createOne(args['data']);  // 触发权限检查
+        return hasQuery ? await service.readOne(key, query) : true;
+      }
+
+      if (action === 'update') {
+        const key = await service.updateOne(args['id'], args['data']);  // 触发权限检查
+        return hasQuery ? await service.readOne(key, query) : true;
+      }
+
+      if (action === 'delete') {
+        await service.deleteOne(args['id']);  // 触发权限检查
+        return { id: args['id'] };
+      }
+
+      return undefined;
+    } else {
+      // 批量操作
+      if (action === 'create') {
+        const keys = await service.createMany(args['data']);  // 触发权限检查
+        return hasQuery ? await service.readMany(keys, query) : true;
+      }
+
+      if (action === 'update') {
+        const keys: PrimaryKey[] = [];
+
+        if (batchUpdate) {
+          keys.push(...(await service.updateBatch(args['data'])));  // 触发权限检查
+        } else {
+          keys.push(...(await service.updateMany(args['ids'], args['data'])));  // 触发权限检查
+        }
+
+        return hasQuery ? await service.readMany(keys, query) : true;
+      }
+
+      if (action === 'delete') {
+        const keys = await service.deleteMany(args['ids']);  // 触发权限检查
+        return { ids: keys };
+      }
+
+      return undefined;
+    }
+  } catch (err: any) {
+    return formatError(err);
+  }
+}
+```
+
+### 5.6 GraphQL 与 REST API 权限校验对比
+
+| 阶段 | REST API | GraphQL |
+|------|----------|---------|
+| 认证 | authenticate.ts 中间件 | authenticate.ts 中间件（完全相同） |
+| Accountability | req.accountability | GraphQLService.accountability |
+| 读取权限 | ItemsService.readByQuery 调用 processAst | 相同：通过 GraphQLService.read → ItemsService |
+| 写入权限 | ItemsService.update/delete 调用 validateAccess | 相同：Resolver 直接调用 ItemsService 方法 |
+| 策略加载 | fetchPolicies | 相同：由 ItemsService 内部调用 |
+
+**核心结论：** GraphQL 请求的权限校验与 REST API **完全复用相同的代码路径**，只是入口不同。
+
 ---
 
-## 八、关键设计要点
+## 六、WebSocket 协作请求权限校验链路
 
-### 8.1 权限模型演变
+### 6.1 整体流程概览
 
-Directus v11 引入了**策略 (Policy)** 概念，将权限模型从：
 ```
-角色 → 权限
-```
-演变为：
-```
-角色/用户 → 策略 → 权限
-```
-
-这种设计的优势：
-- 支持多角色继承
-- 支持用户级策略（不依赖角色）
-- 权限规则复用性更好
-- 更灵活的权限组合
-
-### 8.2 权限检查的双重保障
-
-1. **读取操作**：通过 `processAst` 将过滤规则**注入到 SQL 查询**中，在数据库层面过滤数据
-2. **写入操作**：通过 `validateAccess` **实际查询验证**用户是否有权操作目标数据
-
-### 8.3 字段级权限实现
-
-字段级权限通过以下机制实现：
-1. **白名单机制**：`fields` 字段明确列出允许访问的字段
-2. **条件字段访问**：通过 `whenCase` 实现"满足过滤条件时才能访问该字段"
-3. **SQL 层面处理**：使用 `CASE WHEN` 语句，不满足条件时返回 `NULL`
-
-### 8.4 缓存策略
-
-- 权限信息缓存提高性能
-- 权限变更时自动清除缓存
-- 支持 Redis 分布式缓存或本地内存缓存
-
----
-
-*本文档基于 Directus v11 代码分析，版本差异可能导致实现细节有所不同。*
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                    WebSocket 协作请求权限校验完整流程                            │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  【第一阶段：WebSocket 连接建立与认证】                                        │
+│                                                                                │
+│  1. WebSocket 连接请求到达                                                     │
+│     GET /websocket/collab (Upgrade: websocket)                              │
+│     │                                                                         │
+│     ▼                                                                         │
+│  2. WebSocket 认证 (websocket/authenticate.ts)                              │
+│     ┌────────────────────────────────────────────────────────────────────┐  │
+│     │  async function authenticateConnection(message, accountabilityOverrides)│  │
+│     │  {                                                                   │  │
+│     │    // 支持多种认证方式                                               │  │
+│     │    if ('email' in message && 'password' in message) {              │  │
+│     │      // 1. 用户名密码登录                                           │  │
+│     │      const { accessToken, refreshToken } =                         │  │
+│     │        await authenticationService.login(DEFAULT_AUTH_PROVIDER, message);│  │
+│     │      access_token = accessToken;                                    │  │
+│     │    }                                                                │  │
+│     │                                                                      │  │
+│     │    if ('refresh_token' in message) {                               │  │
+│     │      // 2. Refresh Token 刷新                                       │  │
+│     │      const { accessToken, refreshToken } =                         │  │
+│     │        await authenticationService.refresh(message.refresh_token);  │  │
+│     │      access_token = accessToken;                                    │  │
+│     │    }                                                                │  │
+│     │                                                                      │  │
+│     │    if ('access_token' in message) {                                │  │
+│     │      // 3. 直接使用 Access Token                                    │  │
+│     │      access_token = message.access_token;                           │  │
+│     │    }                                                                │  │
+│     │                                                                      │  │
+│     │    // 4. 构建 accountability（与 HTTP 认证相同）                    │  │
+│     │    authenticationState.accountability =                             │  │
+│     │      await getAccountabilityForToken(access_token, defaultAccountability);│  │
+│     │  }                                                                   │  │
+│     └────────────────────────────────────────────────────────────────────┘  │
+│     │                                                                         │
+│     ▼                                                                         │
+│  3. 认证成功，client.accountability 已设置                                   │
+│                                                                                │
+│  ============================================================================ │
+│                                                                                │
+│  【第二阶段：协作房间加入与权限校验】                                          │
+│                                                                                │
+│  4. 客户端发送 join 消息                                                       │
+│     { type: 'collab
