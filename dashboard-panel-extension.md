@@ -438,7 +438,25 @@ export class GraphQLService {
 
 ## 3. 权限校验机制
 
-### 3.1 前端权限检查
+### 3.1 权限架构概述
+
+**关键发现**：权限不是存储在面板配置中的，而是在查询时**动态应用**的。
+
+Directus 的权限体系分为以下几个层次：
+
+| 层级 | 说明 | 存储位置 |
+|------|------|----------|
+| 模块级权限 | 控制是否能访问某个模块 | `directus_permissions` 表 |
+| 集合级权限 | 控制对某个集合的 CRUD 操作 | `directus_permissions` 表 |
+| 项目级权限 | 控制对特定记录的访问 | 动态计算 |
+| 字段级权限 | 控制可访问的字段 | 动态计算 |
+
+**核心机制**：
+- 面板配置（`directus_panels.options`）存储的是**数据源配置**（collection、filter、aggregation 等），不是权限
+- 权限在**查询执行时**通过 `accountability` 对象动态应用
+- 权限配置存储在 `directus_permissions` 表中，与面板配置分离
+
+### 3.2 前端权限检查
 
 **核心 Store**：`app/src/stores/permissions.ts`
 
@@ -496,55 +514,374 @@ export const usePermissionsStore = defineStore({
 });
 ```
 
-### 3.2 项目级权限检查
+### 3.3 后端权限校验核心模块
 
-**Composable**：`app/src/composables/use-permissions/item/use-item-permissions.ts`
+**关键模块**：`api/src/permissions/modules/`
 
-对于具体项目的权限检查，使用 `useItemPermissions`：
+后端权限校验通过三个核心模块实现：
 
-1. **权限获取**：
-   - 调用 `fetchItemPermissions` 获取项目级权限
-   - 检查 `update`、`delete`、`share`、`archive` 等操作权限
+| 模块 | 函数 | 作用 | 触发时机 |
+|------|------|------|----------|
+| **processAst** | `processAst()` | 在查询 AST 中注入权限过滤条件 | **读操作** (read) |
+| **validateAccess** | `validateAccess()` | 验证用户对特定记录的访问权限 | **更新/删除**操作 |
+| **processPayload** | `processPayload()` | 在创建/更新时应用权限预设 | **创建/更新**操作 |
 
-2. **字段级权限**：
-   - 通过 `getFields` 获取可访问的字段列表
+#### 3.3.1 processAst - 读操作权限注入
 
-**核心代码**：
+**作用**：在查询执行前，将权限条件注入到查询 AST 中
+
+**流程**：
+1. 解析用户的权限配置（`directus_permissions` 表）
+2. 提取权限中的 `permissions` 过滤条件
+3. 将过滤条件合并到用户的查询中
+4. 确保用户只能访问有权限的数据
+
+**在 ItemsService 中的调用**：
 ```typescript
-// app/src/composables/use-permissions/item/use-item-permissions.ts:19-37
-export function useItemPermissions(
-    collection: Collection,
-    primaryKey: PrimaryKey,
-    isNew: IsNew,
-    isVersion: MaybeRef<boolean> = false,
-): UsableItemPermissions {
-    const { loading, fetchedItemPermissions, refresh } = fetchItemPermissions(collection, primaryKey);
+// api/src/services/items.ts:499-539
+async readByQuery(query: Query, opts?: QueryOptions): Promise<Item[]> {
+    const updatedQuery =
+        opts?.emitEvents !== false
+            ? await emitter.emitFilter(
+                    this.eventScope === 'items'
+                        ? ['items.query', `${this.collection}.items.query`]
+                        : `${this.eventScope}.query`,
+                    query,
+                    {
+                        collection: this.collection,
+                    },
+                    {
+                        database: this.knex,
+                        schema: this.schema,
+                        accountability: this.accountability,
+                    },
+                )
+            : query;
 
-    const updateAllowed = isActionAllowed(collection, isNew, fetchedItemPermissions, 'update', isVersion);
-    const deleteAllowed = isActionAllowed(collection, isNew, fetchedItemPermissions, 'delete');
-    const shareAllowed = isActionAllowed(collection, isNew, fetchedItemPermissions, 'share');
-    const archiveAllowed = isArchiveAllowed(collection, updateAllowed);
-    const fields = getFields(collection, isNew, fetchedItemPermissions, isVersion);
+    let ast = await getAstFromQuery(
+        {
+            collection: this.collection,
+            query: updatedQuery,
+            accountability: this.accountability,
+        },
+        {
+            schema: this.schema,
+            knex: this.knex,
+        },
+    );
 
-    return { loading, refresh, updateAllowed, deleteAllowed, shareAllowed, archiveAllowed, fields };
+    // 关键：在执行查询前注入权限条件
+    ast = await processAst(
+        { ast, action: 'read', accountability: this.accountability },
+        { knex: this.knex, schema: this.schema },
+    );
+
+    const records = await runAst(ast, this.schema, this.accountability, {
+        knex: this.knex,
+        stripNonRequested: opts?.stripNonRequested !== undefined ? opts.stripNonRequested : true,
+    });
+
+    // ...
 }
 ```
 
-### 3.3 后端权限校验
+**processAst 核心逻辑**（简化）：
+```typescript
+// api/src/permissions/modules/process-ast/process-ast.ts
+export async function processAst(
+    input: { ast: QueryAST; action: PermissionsAction; accountability: Accountability | null },
+    context: { knex: Knex; schema: SchemaOverview },
+): Promise<QueryAST> {
+    if (!input.accountability) return input.ast;
 
-**核心机制**：`accountability` 对象
+    // 1. 检查用户是否有该集合的权限
+    const collectionAccess = fetchAccountabilityCollectionAccess(...);
+    
+    if (collectionAccess.access === 'none') {
+        throw new ForbiddenError();
+    }
 
-后端通过 `accountability` 对象进行权限校验，该对象包含：
+    // 2. 如果是 'partial' 权限，需要注入权限过滤条件
+    if (collectionAccess.access === 'partial') {
+        // 从权限配置中提取过滤条件
+        const permissionFilters = collectionAccess.permissions;
+        
+        // 将权限过滤条件合并到查询 AST 中
+        input.ast.query.filter = {
+            _and: [
+                input.ast.query.filter, // 用户查询的 filter
+                permissionFilters,       // 权限配置的 filter
+            ].filter(Boolean),
+        };
+    }
 
-- `user`：用户信息
-- `role`：角色信息
-- `permissions`：权限配置
-- `ip`：请求 IP
-- `admin`：是否为管理员
+    // 3. 字段级权限检查
+    // 检查请求的字段是否在允许的字段列表中
+    const allowedFields = fetchAllowedFields(...);
+    const requestedFields = extractFieldsFromQuery(input.ast);
+    
+    for (const field of requestedFields) {
+        if (!allowedFields.includes(field)) {
+            throw new ForbiddenError(`You don't have permission to access the "${field}" field`);
+        }
+    }
 
-**服务层权限应用**：
+    return input.ast;
+}
+```
 
-`PanelsService` 继承自 `ItemsService`，自动应用权限校验：
+#### 3.3.2 validateAccess - 写操作权限验证
+
+**作用**：在更新/删除操作前，验证用户对特定记录的访问权限
+
+**流程**：
+1. 检查用户是否有该集合的 `update` 或 `delete` 权限
+2. 如果是 'partial' 权限，需要验证目标记录是否符合权限条件
+3. 确保用户只能修改有权限的记录
+
+**在 ItemsService 中的调用**：
+```typescript
+// api/src/services/items.ts:748-766
+async updateMany(keys: PrimaryKey[], data: Partial<Item>, opts?: MutationOptions): Promise<PrimaryKey[]> {
+    // ...
+
+    keys.sort();
+
+    if (this.accountability) {
+        // 关键：在更新前验证访问权限
+        await validateAccess(
+            {
+                accountability: this.accountability,
+                action: 'update',
+                collection: this.collection,
+                primaryKeys: keys,
+            },
+            {
+                knex: this.knex,
+                schema: this.schema,
+            },
+        );
+    }
+
+    // ... 执行更新
+}
+
+// api/src/services/items.ts:1094-1110
+async deleteMany(keys: PrimaryKey[], opts?: MutationOptions): Promise<PrimaryKey[]> {
+    // ...
+
+    keysAfterHooks = uniq(keysAfterHooks);
+
+    if (this.accountability) {
+        // 关键：在删除前验证访问权限
+        await validateAccess(
+            {
+                accountability: this.accountability,
+                action: 'delete',
+                collection: this.collection,
+                primaryKeys: keysAfterHooks,
+            },
+            {
+                knex: this.knex,
+                schema: this.schema,
+            },
+        );
+    }
+
+    // ... 执行删除
+}
+```
+
+**validateAccess 核心逻辑**（简化）：
+```typescript
+// api/src/permissions/modules/validate-access/validate-access.ts
+export async function validateAccess(
+    input: {
+        accountability: Accountability;
+        action: 'create' | 'read' | 'update' | 'delete' | 'share';
+        collection: string;
+        primaryKeys?: PrimaryKey[];
+    },
+    context: { knex: Knex; schema: SchemaOverview },
+): Promise<void> {
+    const { accountability, action, collection, primaryKeys } = input;
+
+    // 1. 检查集合级权限
+    const collectionAccess = fetchAccountabilityCollectionAccess(...);
+
+    if (collectionAccess.access === 'none') {
+        throw new ForbiddenError(`You don't have permission to ${action} ${collection}`);
+    }
+
+    if (collectionAccess.access === 'full') {
+        // 完全权限，无需进一步检查
+        return;
+    }
+
+    // 2. partial 权限：需要验证具体记录
+    if (primaryKeys && primaryKeys.length > 0) {
+        // 从权限配置中获取过滤条件
+        const permissionFilters = collectionAccess.permissions;
+
+        // 构建查询：检查这些主键的记录是否符合权限条件
+        const query = context.knex(collection)
+            .whereIn('id', primaryKeys)
+            .andWhere(permissionFilters); // 应用权限过滤条件
+
+        const validRecords = await query.select('id');
+        const validIds = validRecords.map(r => r.id);
+
+        // 检查是否所有请求的记录都有效
+        const invalidIds = difference(primaryKeys, validIds);
+        
+        if (invalidIds.length > 0) {
+            throw new ForbiddenError(
+                `You don't have permission to ${action} the following records: ${invalidIds.join(', ')}`
+            );
+        }
+    }
+}
+```
+
+#### 3.3.3 processPayload - 创建/更新时的权限预设
+
+**作用**：在创建/更新操作时，自动应用权限配置中的 `presets`
+
+**流程**：
+1. 检查用户是否有该集合的 `create` 或 `update` 权限
+2. 应用权限配置中的 `presets`（预设值）
+3. 限制可修改的字段（字段级权限）
+
+**在 ItemsService 中的调用**：
+```typescript
+// api/src/services/items.ts:172-186
+async createOne(data: Partial<Item>, opts: MutationOptions = {}): Promise<PrimaryKey> {
+    // ...
+
+    // 在事务中执行
+    const primaryKey: PrimaryKey = await transaction(this.knex, async (trx) => {
+        // ... filter hooks ...
+
+        // 关键：应用权限预设
+        const payloadWithPresets = this.accountability
+            ? await processPayload(
+                    {
+                        accountability: this.accountability,
+                        action: 'create',
+                        collection: this.collection,
+                        payload: payloadAfterHooks,
+                        nested: this.nested,
+                    },
+                    {
+                        knex: trx,
+                        schema: this.schema,
+                    },
+                )
+            : payloadAfterHooks;
+
+        // ... 执行创建
+    });
+
+    // ...
+}
+
+// api/src/services/items.ts:768-782
+async updateMany(keys: PrimaryKey[], data: Partial<Item>, opts?: MutationOptions): Promise<PrimaryKey[]> {
+    // ... validateAccess 之后 ...
+
+    // 关键：应用权限预设
+    const payloadWithPresets = this.accountability
+        ? await processPayload(
+                {
+                    accountability: this.accountability,
+                    action: 'update',
+                    collection: this.collection,
+                    payload: payloadAfterHooks,
+                    nested: this.nested,
+                },
+                {
+                    knex: this.knex,
+                    schema: this.schema,
+                },
+            )
+        : payloadAfterHooks;
+
+    // ... 执行更新
+}
+```
+
+**processPayload 核心逻辑**（简化）：
+```typescript
+// api/src/permissions/modules/process-payload/process-payload.ts
+export async function processPayload(
+    input: {
+        accountability: Accountability;
+        action: 'create' | 'update';
+        collection: string;
+        payload: AnyItem;
+        nested?: string[];
+    },
+    context: { knex: Knex; schema: SchemaOverview },
+): Promise<AnyItem> {
+    const { accountability, action, collection, payload } = input;
+
+    // 1. 检查集合级权限
+    const collectionAccess = fetchAccountabilityCollectionAccess(...);
+
+    if (collectionAccess.access === 'none') {
+        throw new ForbiddenError();
+    }
+
+    // 2. 字段级权限：检查 payload 中的字段是否允许修改
+    const allowedFields = fetchAllowedFields(
+        accountability,
+        action,
+        collection,
+        context.schema,
+    );
+
+    const payloadFields = Object.keys(payload);
+    const forbiddenFields = difference(payloadFields, allowedFields);
+
+    if (forbiddenFields.length > 0) {
+        throw new ForbiddenError(
+            `You don't have permission to modify the following fields: ${forbiddenFields.join(', ')}`
+        );
+    }
+
+    // 3. 应用权限预设 (presets)
+    const presets = collectionAccess.presets;
+    let processedPayload = { ...payload };
+
+    if (presets && Object.keys(presets).length > 0) {
+        // presets 中的值会强制覆盖或添加到 payload 中
+        // 例如：presets = { status: 'draft', created_by: $CURRENT_USER }
+        processedPayload = { ...processedPayload, ...presets };
+    }
+
+    // 4. 对于 'partial' 权限，可能需要额外的验证
+    if (collectionAccess.access === 'partial' && action === 'create') {
+        // 验证创建的 payload 是否符合权限条件
+        // 例如：权限要求 category = 'news'，则 payload 中 category 必须是 'news'
+        const validation = validatePayloadAgainstPermissions(
+            processedPayload,
+            collectionAccess.permissions,
+        );
+
+        if (!validation.valid) {
+            throw new ForbiddenError(validation.reason);
+        }
+    }
+
+    return processedPayload;
+}
+```
+
+### 3.4 服务层权限应用
+
+**核心服务**：`ItemsService`
+
+`PanelsService` 和 `DashboardsService` 都继承自 `ItemsService`，自动继承所有权限校验逻辑：
 
 ```typescript
 // api/src/services/panels.ts:4-7
@@ -553,26 +890,32 @@ export class PanelsService extends ItemsService {
         super('directus_panels', options);
     }
 }
+
+// api/src/services/dashboards.ts:4-7
+export class DashboardsService extends ItemsService {
+    constructor(options: AbstractServiceOptions) {
+        super('directus_dashboards', options);
+    }
+}
 ```
 
-**控制器中的使用**：
-
+**控制器中的使用模式**：
 ```typescript
 // api/src/controllers/panels.ts:16-53
 router.post(
     '/',
     asyncHandler(async (req, res, next) => {
         const service = new PanelsService({
-            accountability: req.accountability,
+            accountability: req.accountability,  // 关键：传递 accountability
             schema: req.schema,
         });
 
         // 调用服务方法时会自动应用权限校验
         if (Array.isArray(req.body)) {
-            const keys = await service.createMany(req.body);
+            const keys = await service.createMany(req.body);  // 内部调用 processPayload
             savedKeys.push(...keys);
         } else {
-            const key = await service.createOne(req.body);
+            const key = await service.createOne(req.body);  // 内部调用 processPayload
             savedKeys.push(key);
         }
         // ...
@@ -581,11 +924,11 @@ router.post(
 );
 ```
 
-### 3.4 模块访问权限
+### 3.5 模块访问权限
 
 **模块定义**：`app/src/modules/insights/index.ts`
 
-模块级别通过 `preRegisterCheck` 进行权限检查：
+模块级别通过 `preRegisterCheck` 进行权限检查，控制用户是否能访问仪表盘模块：
 
 ```typescript
 // app/src/modules/insights/index.ts:42-49
@@ -594,10 +937,76 @@ preRegisterCheck(user, permissions) {
 
     if (admin) return true;
 
+    // 检查用户是否有 directus_dashboards 集合的 read 权限
     const access = permissions['directus_dashboards']?.['read']?.access;
     return access === 'partial' || access === 'full';
 },
 ```
+
+### 3.6 权限关系总结
+
+#### 3.6.1 权限层级关系
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         权限层级架构                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              模块级权限 (Module Level)                    │   │
+│  │  ─────────────────────────────────────────────────────  │   │
+│  │  控制：是否能访问仪表盘模块                                │   │
+│  │  位置：modules/*/index.ts (preRegisterCheck)            │   │
+│  │  检查：permissions['directus_dashboards']?.read         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              ↓                                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │           集合级权限 (Collection Level)                   │   │
+│  │  ─────────────────────────────────────────────────────  │   │
+│  │  控制：对集合的 CRUD 操作权限                              │   │
+│  │  位置：directus_permissions 表                            │   │
+│  │  影响：                                                    │   │
+│  │    • directus_dashboards - 仪表盘配置的增删改查          │   │
+│  │    • directus_panels - 面板配置的增删改查                │   │
+│  │    • 业务集合 (如 articles, users) - 面板数据源的权限    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              ↓                                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │           项目级权限 (Item Level)                         │   │
+│  │  ─────────────────────────────────────────────────────  │   │
+│  │  控制：对特定记录的访问权限                                │   │
+│  │  位置：directus_permissions.permissions (过滤条件)        │   │
+│  │  应用：                                                    │   │
+│  │    • 读操作：processAst 注入 WHERE 条件                  │   │
+│  │    • 写操作：validateAccess 验证记录是否符合条件         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              ↓                                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │           字段级权限 (Field Level)                        │   │
+│  │  ─────────────────────────────────────────────────────  │   │
+│  │  控制：可访问/修改的字段                                  │   │
+│  │  位置：directus_permissions.fields                        │   │
+│  │  应用：                                                    │   │
+│  │    • 读操作：检查请求的字段是否在允许列表中              │   │
+│  │    • 写操作：processPayload 过滤不允许的字段             │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.6.2 权限与面板的关系
+
+| 权限类型 | 存储位置 | 应用时机 | 与面板的关系 |
+|----------|----------|----------|--------------|
+| **仪表盘配置权限** | `directus_permissions` (collection: `directus_dashboards`) | 仪表盘 CRUD 时 | 控制能否创建/修改/删除仪表盘 |
+| **面板配置权限** | `directus_permissions` (collection: `directus_panels`) | 面板 CRUD 时 | 控制能否创建/修改/删除面板 |
+| **数据源权限** | `directus_permissions` (collection: 业务集合，如 `articles`) | **面板数据查询时** | **动态应用**，控制面板能访问哪些数据 |
+| **模块访问权限** | 模块定义中的 `preRegisterCheck` | 模块加载时 | 控制能否访问仪表盘模块 |
+
+**关键点**：
+- 面板配置（`directus_panels.options`）存储的是**数据源配置**（查询哪个集合、用什么过滤条件等）
+- 权限配置（`directus_permissions`）与面板配置**分离存储**
+- 数据查询时，权限条件会**动态注入**到查询中，与面板配置的过滤条件合并
 
 ---
 
@@ -622,10 +1031,27 @@ preRegisterCheck(user, permissions) {
 | `position_y` | integer | Y 轴位置 |
 | `width` | integer | 宽度 |
 | `height` | integer | 高度 |
-| `options` | json | 面板特定配置选项 |
+| `options` | json | 面板特定配置选项（**数据源配置，不含权限**） |
 | `dashboard` | uuid | 所属仪表盘 ID |
 | `date_created` | timestamp | 创建时间 |
 | `user_created` | uuid | 创建用户 |
+
+**关键字段说明 - `options`**:
+
+`options` 字段存储的是面板的**数据源配置**，不包含权限信息。例如 `metric` 类型面板的 `options` 可能包含：
+
+```json
+{
+  "collection": "articles",
+  "field": "views",
+  "function": "sum",
+  "filter": {
+    "status": {
+      "_eq": "published"
+    }
+  }
+}
+```
 
 **字段定义**：
 ```yaml
@@ -712,7 +1138,7 @@ const panelsWithEdits = computed(() => {
 // app/src/stores/insights.ts:325-328
 function stagePanelCreate(panel: CreatePanel) {
     edits.create.push(panel);
-    loadPanelData(panel);
+    loadPanelData(panel);  // 立即加载数据用于预览
 }
 ```
 
@@ -1008,174 +1434,310 @@ async function refresh(dashboard: string) {
 
 ---
 
-## 5. 完整协作流程图
+## 5. 完整时序流程
 
-### 5.1 面板配置与保存流程
+### 5.1 权限配置存储说明
 
-```
-用户配置面板
-    ↓
-前端: panel-configuration.vue
-    ↓ 选择面板类型、配置选项
-stagePanelCreate / stagePanelUpdate
-    ↓
-edits.create / edits.update (暂存)
-    ↓ 实时预览（如果查询变化）
-loadPanelData
-    ↓ 准备查询
-prepareQuery → 调用面板的 query() 函数
-    ↓ 应用变量替换
-applyOptionsData
-    ↓ 转换为 GraphQL
-queryToGqlString
-    ↓ 发送请求
-POST /graphql
-    ↓
-后端: GraphQLService
-    ↓ 权限校验
-accountability 传递到 ItemsService
-    ↓ 执行查询
-readByQuery / readOne
-    ↓ 返回数据
-    ↓
-前端: data.value[panel.id] = 结果
-    ↓ 面板组件渲染
-<component :is="panel-${type}" :data="data" />
-    ↓ 用户点击保存
-saveChanges
-    ↓
-POST /panels (创建)
-PATCH /panels (更新)
-DELETE /panels (删除)
-    ↓
-后端: PanelsService → ItemsService
-    ↓ 权限校验
-accountability 检查
-    ↓ 数据库操作
-directus_panels 表 CRUD
-    ↓ 返回结果
-    ↓
-前端: hydrate() 重新加载
-    ↓
-clearEdits() 清空暂存
-```
+在开始时序分析之前，明确一个关键概念：
 
-### 5.2 权限校验流程
+**面板配置与权限配置是分离存储的**：
+
+| 配置类型 | 存储位置 | 内容 | 应用时机 |
+|----------|----------|------|----------|
+| **面板配置** | `directus_panels` 表 | 数据源、过滤条件、聚合方式等 | 面板渲染时读取 |
+| **权限配置** | `directus_permissions` 表 | 集合权限、过滤条件、字段限制等 | **查询执行时动态应用** |
+
+**关键点**：
+- 面板的 `options.filter` 是**用户配置的过滤条件**，不是权限
+- 权限配置中的 `permissions.filter` 是**系统强制的权限条件**
+- 查询执行时，两者会通过 `processAst` 合并为最终的 WHERE 条件
+
+### 5.2 用户编辑面板数据源配置时序
 
 ```
-用户请求操作
-    ↓
-前端权限检查 (可选)
-    ├── usePermissionsStore.hasPermission()
-    └── useItemPermissions.updateAllowed
-    ↓
-API 请求
-    ↓
-后端中间件
-    ├── 解析 accountability (用户、角色、权限)
-    └── 传递到服务层
-    ↓
-服务层 (PanelsService → ItemsService)
-    ↓ 权限校验
-    ├── 检查 collection 权限
-    ├── 检查 action 权限 (create/read/update/delete)
-    ├── 应用权限预设 (presets)
-    └── 字段级权限过滤
-    ↓
-数据库操作
-    ↓ 返回结果
-    ↓
-前端处理响应
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                      阶段1: 用户编辑面板数据源配置                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  ┌──────────────┐     ┌──────────────────────┐     ┌─────────────────────────────┐   │
+│  │   用户界面    │     │  panel-configuration │     │      insightsStore          │   │
+│  │              │     │         .vue         │     │                             │   │
+│  └──────┬───────┘     └──────────┬───────────┘     └──────────────┬──────────────┘   │
+│         │                        │                                  │                   │
+│         │  选择面板类型(metric)   │                                  │                   │
+│         │───────────────────────>│                                  │                   │
+│         │                        │                                  │                   │
+│         │  配置数据源：           │                                  │                   │
+│         │  collection: articles  │                                  │                   │
+│         │  field: views          │                                  │                   │
+│         │  function: sum         │                                  │                   │
+│         │  filter: status=active │                                  │                   │
+│         │───────────────────────>│                                  │                   │
+│         │                        │                                  │                   │
+│         │                        │  stagePanelUpdate()             │                   │
+│         │                        │────────────────────────────────>│                   │
+│         │                        │                                  │                   │
+│         │                        │                                  │  检查 options 变化  │
+│         │                        │                                  │  调用 panel.query() │
+│         │                        │                                  │  生成查询配置       │
+│         │                        │                                  │                   │
+│         │                        │                                  │  loadPanelData()  │
+│         │                        │                                  │─────────────┐     │
+│         │                        │                                  │             │     │
+│         │                        │                                  │    ┌────────▼────┐│
+│         │                        │                                  │    │  构建 GraphQL ││
+│         │                        │                                  │    │  查询请求     ││
+│         │                        │                                  │    └────────┬────┘│
+│         │                        │                                  │             │     │
+│         │                        │                                  │  POST /graphql│    │
+│         │                        │                                  │─────────────>│     │
+│         │                        │                                  │             │     │
+│         │                        │                                  │  存储预览数据 │     │
+│         │                        │                                  │  data[panel.id]│   │
+│         │                        │                                  │<─────────────│     │
+│         │                        │                                  │             │     │
+│         │  显示预览数据           │                                  │             │     │
+│         │<───────────────────────│                                  │             │     │
+│         │                        │                                  │             │     │
+└─────────┴────────────────────────┴──────────────────────────────────┴─────────────┘   │
+                                                                                          │
+  【关键】此时：
+  - 面板配置暂存在 edits.update 中，未写入数据库
+  - 数据查询用于预览，权限已在后端动态应用
+  - 用户配置的 filter 与权限配置的 filter 已合并
+                                                                                          │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.3 变量面板与依赖面板协作流程
+### 5.3 保存面板配置到数据库时序
 
 ```
-用户设置变量面板值
-    ↓
-setVariable(field, value)
-    ↓
-variables.value[field] = value
-    ↓ 查找依赖此变量的面板
-regex = /{{\s*field\s*}}/
-    ↓ 检查查询是否变化
-oldQuery vs newQuery (应用新变量值)
-    ↓ 如果变化
-loadPanelData(dependentPanels)
-    ↓ 重新查询数据
-    ↓
-依赖面板重新渲染
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                      阶段2: 保存面板配置到数据库                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  ┌──────────────┐     ┌──────────────────────┐     ┌─────────────────────────────┐   │
+│  │   用户界面    │     │     dashboard.vue    │     │      insightsStore          │   │
+│  └──────┬───────┘     └──────────┬───────────┘     └──────────────┬──────────────┘   │
+│         │                        │                                  │                   │
+│         │  点击"保存"按钮        │                                  │                   │
+│         │───────────────────────>│                                  │                   │
+│         │                        │                                  │                   │
+│         │                        │  saveChanges()                  │                   │
+│         │                        │────────────────────────────────>│                   │
+│         │                        │                                  │                   │
+│         │                        │                                  │  收集请求：        │
+│         │                        │                                  │  • edits.create   │
+│         │                        │                                  │  • edits.update   │
+│         │                        │                                  │  • edits.delete   │
+│         │                        │                                  │                   │
+│         │                        │                                  │  发送请求到后端    │
+│         │                        │                                  │                   │
+└─────────┴────────────────────────┴──────────────────────────────────┴─────────────────┘ │
+                                          ↓                                                   │
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                         后端：保存面板配置                                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  ┌──────────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐   │
+│  │  panelsController    │     │    PanelsService     │     │    ItemsService     │   │
+│  └──────────┬───────────┘     └──────────┬───────────┘     └──────────┬──────────┘   │
+│             │                              │                              │              │
+│             │  POST /panels (create)      │                              │              │
+│             │─────────────────────────────>│                              │              │
+│             │                              │                              │              │
+│             │                              │  创建 ItemsService 实例      │              │
+│             │                              │  accountability: req.account │              │
+│             │                              │─────────────────────────────>│              │
+│             │                              │                              │              │
+│             │                              │  createMany(req.body)        │              │
+│             │                              │─────────────────────────────>│              │
+│             │                              │                              │              │
+│             │                              │                              │  权限校验：   │
+│             │                              │                              │              │
+│             │                              │                              │  1. 检查用户 │
+│             │                              │                              │     是否有    │
+│             │                              │                              │     directus_ │
+│             │                              │                              │     panels的  │
+│             │                              │                              │     create权限│
+│             │                              │                              │              │
+│             │                              │                              │  2. process- │
+│             │                              │                              │     Payload   │
+│             │                              │                              │     应用 presets│
+│             │                              │                              │              │
+│             │                              │                              │  3. 写入数据库│
+│             │                              │                              │              │
+│             │                              │                              │  INSERT INTO  │
+│             │                              │                              │  directus_    │
+│             │                              │                              │  panels       │
+│             │                              │                              │              │
+│             │                              │ 返回主键列表                  │              │
+│             │                              │<─────────────────────────────│              │
+│             │                              │                              │              │
+│             │  返回创建的面板数据          │                              │              │
+│             │<─────────────────────────────│                              │              │
+│             │                              │                              │              │
+└─────────────┴──────────────────────────────┴──────────────────────────────┴──────────────┘ │
+                                                                                          │
+  【关键】此时保存到数据库的是：
+  - 面板配置（options）：包含 collection、filter、function 等
+  - 不包含权限配置！权限在 directus_permissions 表中
+                                                                                          │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+### 5.4 请求载荷详细分析
 
-## 6. 关键代码位置索引
+**创建面板的请求载荷**：
 
-### 6.1 前端扩展
-| 功能 | 文件路径 |
-|------|----------|
-| 扩展加载与注册 | `app/src/extensions.ts` |
-| 面板注册 | `app/src/panels/index.ts` |
-| 面板定义示例 | `app/src/panels/metric/index.ts` |
-| 仪表盘模块 | `app/src/modules/insights/index.ts` |
-| 仪表盘视图 | `app/src/modules/insights/routes/dashboard.vue` |
-| 面板配置 | `app/src/modules/insights/routes/panel-configuration.vue` |
+```typescript
+// POST /panels
+// 请求体示例
+{
+  "name": "文章浏览量统计",
+  "type": "metric",
+  "position_x": 0,
+  "position_y": 0,
+  "width": 12,
+  "height": 2,
+  "dashboard": "dashboard-uuid-123",
+  "options": {
+    // 数据源配置，不包含权限
+    "collection": "articles",
+    "field": "views",
+    "function": "sum",
+    "filter": {
+      // 用户配置的过滤条件，不是权限
+      "status": { "_eq": "published" }
+    }
+  }
+}
+```
 
-### 6.2 数据管理
-| 功能 | 文件路径 |
-|------|----------|
-| 仪表板面数据 Store | `app/src/stores/insights.ts` |
-| 权限 Store | `app/src/stores/permissions.ts` |
-| 项目级权限 | `app/src/composables/use-permissions/item/use-item-permissions.ts` |
-| 变量替换工具 | `@directus/utils` (applyOptionsData) |
+**后端处理后的存储数据**（`directus_panels` 表）：
 
-### 6.3 后端服务
-| 功能 | 文件路径 |
-|------|----------|
-| 面板服务 | `api/src/services/panels.ts` |
-| 面板控制器 | `api/src/controllers/panels.ts` |
-| GraphQL 服务 | `api/src/services/graphql/index.ts` |
-| GraphQL 控制器 | `api/src/controllers/graphql.ts` |
-| 扩展管理器 | `api/src/extensions/manager.ts` |
+```sql
+-- 插入到 directus_panels 表
+INSERT INTO directus_panels (
+  id,
+  name,
+  type,
+  position_x,
+  position_y,
+  width,
+  height,
+  dashboard,
+  options,  -- JSON 格式存储数据源配置
+  user_created,
+  date_created
+) VALUES (
+  'panel-uuid-456',
+  '文章浏览量统计',
+  'metric',
+  0,
+  0,
+  12,
+  2,
+  'dashboard-uuid-123',
+  -- options 字段存储的是数据源配置，不是权限
+  '{"collection":"articles","field":"views","function":"sum","filter":{"status":{"_eq":"published"}}}',
+  'user-uuid-789',
+  NOW()
+);
+```
 
-### 6.4 数据模型
-| 功能 | 文件路径 |
-|------|----------|
-| 面板表字段 | `packages/system-data/src/fields/panels.yaml` |
-| 面板 SDK 类型 | `sdk/src/schema/panel.ts` |
+**权限配置存储**（`directus_permissions` 表）：
 
----
+```sql
+-- 权限配置与面板配置分离存储
+INSERT INTO directus_permissions (
+  id,
+  role,
+  collection,  -- 权限针对的集合，不是面板
+  action,      -- create/read/update/delete
+  access,      -- none/partial/full
+  permissions, -- 权限过滤条件（JSON）
+  fields,      -- 允许的字段
+  presets      -- 预设值
+) VALUES (
+  'perm-uuid-abc',
+  'role-uuid-def',
+  'articles',    -- 权限针对 articles 集合
+  'read',        -- 读操作权限
+  'partial',     -- 部分权限
+  -- 权限过滤条件：只能看到 category = 'news' 的文章
+  '{"category":{"_eq":"news"}}',
+  '["id","title","views","status","category"]',
+  NULL
+);
+```
 
-## 7. 总结
+### 5.5 再次进入页面重渲染时序
 
-Directus 仪表盘面板扩展机制是一个设计完善的系统，具有以下特点：
-
-1. **模块化扩展**：
-   - 面板通过 `definePanel` 定义，支持完全自定义
-   - 扩展自动加载和注册，无需手动配置
-   - 支持内部面板和自定义面板的无缝集成
-
-2. **灵活的数据查询**：
-   - 每个面板定义自己的 `query()` 函数，生成查询配置
-   - 使用 GraphQL 进行高效数据查询
-   - 支持变量替换，实现面板间的数据联动
-   - 系统集合和普通集合分离处理
-
-3. **多层权限校验**：
-   - 前端：预检查权限，优化用户体验
-   - 后端：服务层强制权限校验，确保安全
-   - 模块级、集合级、项目级、字段级多层权限控制
-   - `accountability` 对象贯穿整个请求生命周期
-
-4. **完善的编辑体验**：
-   - 暂存编辑机制，支持撤销和预览
-   - 实时数据刷新，配置变化立即反映
-   - 缓存管理，优化性能
-   - 错误边界处理，提升稳定性
-
-5. **数据驱动渲染**：
-   - 面板配置完全存储在数据库
-   - 动态组件渲染，支持运行时切换面板类型
-   - 变量和选项分离，支持灵活配置
-
-这种架构使得 Directus 的仪表盘系统既强大又灵活，用户可以通过简单的配置实现复杂的数据可视化需求，同时保持系统的安全性和可维护性。
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                      阶段3: 再次进入页面重渲染                                            │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  ┌──────────────┐     ┌──────────────────────┐     ┌─────────────────────────────┐   │
+│  │   用户界面    │     │    insights/index.ts │     │      insightsStore          │   │
+│  └──────┬───────┘     └──────────┬───────────┘     └──────────────┬──────────────┘   │
+│         │                        │                                  │                   │
+│         │  导航到仪表盘页面       │                                  │                   │
+│         │───────────────────────>│                                  │                   │
+│         │                        │                                  │                   │
+│         │                        │  beforeEnter 钩子                │                   │
+│         │                        │  store.refresh(dashboardId)    │                   │
+│         │                        │────────────────────────────────>│                   │
+│         │                        │                                  │                   │
+│         │                        │                                  │  hydrate()        │
+│         │                        │                                  │  ─────────────    │
+│         │                        │                                  │  1. 从 API 加载   │
+│         │                        │                                  │     仪表盘和面板   │
+│         │                        │                                  │     配置数据       │
+│         │                        │                                  │                   │
+│         │                        │                                  │  GET /dashboards  │
+│         │                        │                                  │  ?fields=*.*      │
+│         │                        │                                  │──────────────────>│
+│         │                        │                                  │                   │
+└─────────┴────────────────────────┴──────────────────────────────────┴─────────────────┘ │
+                                          ↓                                                   │
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                         后端：加载面板配置                                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  ┌──────────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐   │
+│  │ dashboardsController │     │  DashboardsService   │     │    ItemsService     │   │
+│  └──────────┬───────────┘     └──────────┬───────────┘     └──────────┬──────────┘   │
+│             │                              │                              │              │
+│             │  GET /dashboards/:id         │                              │              │
+│             │  fields=panels.*             │                              │              │
+│             │─────────────────────────────>│                              │              │
+│             │                              │                              │              │
+│             │                              │  readOne(pk, query)          │              │
+│             │                              │─────────────────────────────>│              │
+│             │                              │                              │              │
+│             │                              │                              │  权限校验：   │
+│             │                              │                              │              │
+│             │                              │                              │  1. 检查用户 │
+│             │                              │                              │     是否有    │
+│             │                              │                              │     directus_ │
+│             │                              │                              │     dashboards│
+│             │                              │                              │     的 read   │
+│             │                              │                              │     权限       │
+│             │                              │                              │              │
+│             │                              │                              │  2. processAst│
+│             │                              │                              │     注入权限   │
+│             │                              │                              │     过滤条件    │
+│             │                              │                              │              │
+│             │                              │                              │  3. 查询数据库│
+│             │                              │                              │              │
+│             │                              │                              │  SELECT *     │
+│             │                              │                              │  FROM directus│
+│             │                              │                              │  _dashboards  │
+│             │                              │                              │  JOIN directus│
+│             │                              │                              │  _panels      │
+│             │                              │                              │  ON dashboard │
+│             │                              │                              │  = dashboard.id│
+│             │                              │                              │              │
+│
