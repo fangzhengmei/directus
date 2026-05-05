@@ -160,38 +160,51 @@ throw new InvalidPayloadError({
 });
 ```
 
-**验证流程图**：
+**验证流程图（修正后）**：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    validateApplyDiff 执行流程                     │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Joi Schema 验证（必填字段、格式）                              │
-│      ↓ 失败 → throw "hash is required" 等                        │
-│  2. 检查是否为空 diff                                              │
-│      ↓ 为空 → return false（无变更）                               │
-│  3. 快速路径检查 ⭐ 核心                                          │
-│      if (hash 匹配 || force=true) → return true ✅                │
-│      ↓ 不匹配且 force=false                                        │
-│  4. 详细冲突检查（逐个检查每个差异）                                 │
+┌─────────────────────────────────────────────────────────────────────┐
+│                    validateApplyDiff 执行流程                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  1. Joi Schema 验证（必填字段、格式） ⭐ 始终执行                    │
+│      ↓ 失败 → throw "hash is required" 等                            │
+│                                                                      │
+│  2. 空 diff 检查 ⭐ 始终执行                                         │
+│      ↓ 为空 → return false（无变更）                                   │
+│                                                                      │
+│  3. 快速路径检查 ⭐ 核心逻辑                                          │
+│      ┌─────────────────────────────────────────────────────────┐   │
+│      │  if (hash 匹配 OR force=true) {                         │   │
+│      │      return true;  // ✅ 直接放行！                      │   │
+│      │  }                                                       │   │
+│      │  // ⚠️ 注意：force=true 时，下面的代码完全跳过！          │   │
+│      └─────────────────────────────────────────────────────────┘   │
+│      ↓ 只有 hash 不匹配 AND force=false 时才继续                    │
+│                                                                      │
+│  4. 详细冲突检查 ❌ force=true 时完全跳过                             │
 │      ├─ 集合：NEW 检查是否已存在，DELETE 检查是否不存在            │
 │      ├─ 字段：NEW 检查是否已存在，DELETE 检查是否不存在            │
 │      ├─ 系统字段：只允许 EDIT schema.is_indexed                   │
 │      └─ 关系：NEW 检查是否已存在，DELETE 检查是否不存在            │
 │      ↓ 任一检查失败 → throw 具体错误消息                          │
-│  5. 详细检查通过但哈希仍不匹配                                      │
+│                                                                      │
+│  5. 详细检查通过但哈希仍不匹配 ❌ force=true 时完全跳过              │
 │      → throw "Provided hash does not match..." 通用错误           │
-└─────────────────────────────────────────────────────────────────┘
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-#### force 参数的放行条件
+#### force 参数的真实行为（修正后）
+
+**核心发现**：`force=true` 时，函数在第 91 行就直接 `return true`，**后续所有详细检查完全跳过**。
 
 **force 参数的作用**：
 
 | 阶段 | force=true 的影响 | 代码位置 |
 |------|------------------|---------|
 | `/schema/diff` | 绕过版本和数据库厂商限制 | `validateSnapshot(snapshot, force)` |
-| `/schema/apply` | **绕过哈希验证** | `validateApplyDiff(..., force)` |
+| `/schema/apply` | **绕过哈希验证 + 跳过所有详细检查** | `validateApplyDiff(..., force)` |
 
 **force 放行的关键代码** ([`api/src/utils/validate-diff.ts:91`](api/src/utils/validate-diff.ts#L91))：
 ```typescript
@@ -199,10 +212,19 @@ throw new InvalidPayloadError({
 if (applyDiff.hash === currentSnapshotWithHash.hash || force) return true;
 ```
 
-**force=true 时仍会执行的验证**：
-1. **Joi Schema 验证**：确保 diff 格式正确（必须有 hash、diff 等字段）
-2. **空 diff 检查**：无变更时不执行
-3. **系统字段操作限制**：只允许修改 `schema.is_indexed`
+**这是一个 OR 条件**：只要满足任一条件，函数立即返回 `true`，后续代码不再执行。
+
+**force=true 时仍会执行的验证**（修正后）：
+| 验证项 | 是否执行 | 说明 |
+|-------|---------|------|
+| Joi Schema 验证 | ✅ 执行 | 检查 diff 格式是否正确（必须有 hash、diff 等字段） |
+| 空 diff 检查 | ✅ 执行 | 无变更时返回 false |
+| 详细冲突检查（NEW/DELETE 存在性） | ❌ **不执行** | force=true 时直接跳过 |
+| 系统字段操作限制 | ❌ **不执行** | force=true 时直接跳过 |
+
+**重要修正**：之前的文档错误地认为系统字段操作限制在 force=true 时仍会执行。实际代码逻辑是：**force=true 时，第 91 行直接 return true，第 93-198 行的所有详细检查完全跳过**。
+
+**但请注意**：即使 `validateApplyDiff` 放行，**底层服务（如 CollectionsService）仍会做自己的检查**。例如 `CollectionsService.createOne` 会检查集合是否已存在，所以即使 `force=true`，执行阶段仍可能失败。
 
 **force 参数的使用场景**：
 
