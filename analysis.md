@@ -1695,6 +1695,146 @@ RenderTemplate 中:
 
 ---
 
+#### 7.8.7 精细化验证：触发条件真值矩阵
+
+**核心问题**：`subPart?.value || subPart` 的行为取决于两个关键因素：
+1. `subPart?.value` 的值类型（是否为假值）
+2. `subPart.value` 的包装方式（数组友好 vs 非数组友好）
+
+**数组友好组件列表**（`render-template.vue:106`）：
+```javascript
+['related-values', 'formatted-value', 'formatted-json-value', 'translations']
+```
+
+**数据结构差异**：
+
+| 组件类型 | value 来源 | subPart.value 结构 | 示例 |
+|---------|-----------|-------------------|------|
+| **数组友好** | 直接使用 `value`（数组） | `value: [原始值]` | `value: [0]`, `value: [false]`, `value: [""]` |
+| **非数组友好** | `value.map((v) => ({ ..., value: v }))` | `value: 原始值（已展开）` | `value: 0`, `value: false`, `value: ""` |
+
+**关键差异**：
+- 数组友好组件的 `subPart.value` 总是数组，即使只包含一个假值
+- 非数组友好组件的 `subPart.value` 是展开后的单个值
+
+**触发条件真值矩阵**：
+
+| 原始值 | 组件类型 | subPart.value | `subPart?.value \|\| subPart` | 实际显示 | 偏差？ |
+|-------|---------|---------------|------------------------------|---------|--------|
+| `"Hello"` | 数组友好 | `["Hello"]` | `["Hello"]` (数组为真) → `"Hello"` | `"Hello"` | 否 |
+| `"Hello"` | 非数组友好 | `"Hello"` | `"Hello"` | `"Hello"` | 否 |
+| `""` | 数组友好 | `[""]` | `[""]` (数组为真) → `""` | `""` | 否 |
+| `""` | 非数组友好 | `""` | `subPart` (对象) → `"[object Object]"` | `"[object Object]"` | ✅ 是 |
+| `42` | 数组友好 | `[42]` | `[42]` → `"42"` | `"42"` | 否 |
+| `42` | 非数组友好 | `42` | `42` → `"42"` | `"42"` | 否 |
+| `0` | 数组友好 | `[0]` | `[0]` (数组为真) → `"0"` | `"0"` | 否 |
+| `0` | 非数组友好 | `0` | `subPart` (对象) → `"[object Object]"` | `"[object Object]"` | ✅ 是 |
+| `true` | 数组友好 | `[true]` | `[true]` → `"true"` | `"true"` | 否 |
+| `true` | 非数组友好 | `true` | `true` → `"true"` | `"true"` | 否 |
+| `false` | 数组友好 | `[false]` | `[false]` (数组为真) → `"false"` | `"false"` | 否 |
+| `false` | 非数组友好 | `false` | `subPart` (对象) → `"[object Object]"` | `"[object Object]"` | ✅ 是 |
+| `null` | 数组友好 | `[null]` | `[null]` (数组为真) → `""`(1) | `""` | 视情况 |
+| `null` | 非数组友好 | `null` | `subPart` (对象) → `"[object Object]"` | `"[object Object]"` | ✅ 是 |
+| `undefined` | 数组友好 | `[undefined]` | `[undefined]` (数组为真) → `""` | `""` | 视情况 |
+| `undefined` | 非数组友好 | `undefined` | `subPart` (对象) → `"[object Object]"` | `"[object Object]"` | ✅ 是 |
+| `[1, 2, 3]` | 数组友好 | `[[1,2,3]]` | `[[1,2,3]]` → `"1,2,3"` | `"1,2,3"` | 视情况 |
+| `[1, 2, 3]` | 非数组友好 | `1`, `2`, `3` (多个 subPart) | `1`, `2`, `3` | `"1" "2" "3"` | 视情况 |
+| `{a: 1}` | 数组友好 | `[{a:1}]` | `[{a:1}]` → `"[object Object]"` | `"[object Object]"` | 视情况 |
+| `{a: 1}` | 非数组友好 | `{a:1}` | `subPart.value={a:1}`(2) → `"[object Object]"` | `"[object Object]"` | 视情况 |
+
+**注释**：
+- (1) 数组 `[null]` 本身是真值，但 `{{ [null] }}` 渲染为 `""`（空字符串）
+- (2) 对象 `{a:1}` 是真值，不会触发 `||` 的回退，但直接插值对象会显示 `"[object Object]"`
+
+**假值触发边界条件表**：
+
+| 假值 | 布尔上下文值 | 数组友好组件（包装为数组） | 非数组友好组件（已展开） |
+|------|-------------|-------------------------|-----------------------|
+| `false` | `false` | `[false]` → 真值(数组) | `false` → 假值 |
+| `0` | `false` | `[0]` → 真值(数组) | `0` → 假值 |
+| `""` | `false` | `[""]` → 真值(数组) | `""` → 假值 |
+| `null` | `false` | `[null]` → 真值(数组) | `null` → 假值 |
+| `undefined` | `false` | `[undefined]` → 真值(数组) | `undefined` → 假值 |
+| `NaN` | `false` | `[NaN]` → 真值(数组) | `NaN` → 假值 |
+
+**核心发现**：
+- **数组友好组件**：所有假值都被包装在数组中，数组本身是真值，因此**不会触发** `||` 的回退
+- **非数组友好组件**：假值直接作为 `subPart.value`，因此**会触发** `||` 的回退
+
+---
+
+#### 7.8.8 受影响的展示组件清单
+
+**数组友好组件（安全，不会触发假值问题）**：
+
+| 组件 ID | 适用场景 | 假值表现 |
+|---------|---------|---------|
+| `formatted-value` | 数字、字符串、文本 | 安全（数组包装） |
+| `related-values` | 关系字段值 | 安全（数组包装） |
+| `formatted-json-value` | JSON 字段 | 安全（数组包装） |
+| `translations` | 多语言翻译字段 | 安全（数组包装） |
+
+**非数组友好组件（可能触发假值问题）**：
+
+| 组件 ID | 适用场景 | 可能的假值 | 风险等级 |
+|---------|---------|-----------|---------|
+| `boolean` | 布尔字段 | `false` | ⚠️ 高 |
+| `datetime` | 日期时间字段 | `null`, `undefined` | ⚠️ 高 |
+| `labels` | CSV 标签 | `[]`(空数组) | ⚠️ 中 |
+| `color` | 颜色字段 | `""`, `null` | ⚠️ 中 |
+| `file` | 单文件字段 | `null`, `undefined` | ⚠️ 高 |
+| `files` | 多文件字段 | `[]`, `null` | ⚠️ 高 |
+| `user` | 用户字段 | `null`, `undefined` | ⚠️ 高 |
+| `rating` | 评分字段 | `0`, `null` | ⚠️ 高 |
+| `progress` | 进度字段 | `0`, `null` | ⚠️ 高 |
+| 其他自定义展示 | 任何自定义扩展 | 取决于实现 | 视情况 |
+
+**典型受影响场景**：
+
+**场景 A：布尔字段使用 display='boolean'（非数组友好）**
+```
+字段: active (type=boolean, display=boolean)
+值: false
+
+正常渲染: display-boolean → "No" 或关闭图标
+VErrorBoundary fallback 触发时:
+  subPart.value = false (已展开，非数组)
+  false || subPart → subPart (对象)
+  {{ subPart }} → "[object Object]"
+实际显示: "[object Object]"
+风险等级: ⚠️ 高
+```
+
+**场景 B：整数字段使用 display='formatted-value'（数组友好）**
+```
+字段: count (type=integer, display=formatted-value)
+值: 0
+
+正常渲染: display-formatted-value → "0"
+VErrorBoundary fallback 触发时:
+  subPart.value = [0] (数组包装)
+  [0] || subPart → [0] (数组为真)
+  {{ [0] }} → "0"
+实际显示: "0"
+风险等级: ❌ 无
+```
+
+**场景 C：日期字段使用 display='datetime'（非数组友好）**
+```
+字段: published_at (type=dateTime, display=datetime)
+值: null
+
+正常渲染: display-datetime → "--" 或空
+VErrorBoundary fallback 触发时:
+  subPart.value = null (已展开，非数组)
+  null || subPart → subPart (对象)
+  {{ subPart }} → "[object Object]"
+实际显示: "[object Object]"
+风险等级: ⚠️ 高
+```
+
+---
+
 ### 7.9 Tabular 与 RenderTemplate 回退行为差异对照
 
 #### 7.9.1 回退机制总览
