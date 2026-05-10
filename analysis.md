@@ -279,6 +279,248 @@ const hasAccess = items && items.length === expectedCount;
 - 无权限访问的字段返回 `NULL`
 - 数据级过滤条件被注入到 WHERE 子句
 
+### 2.4 权限拒绝语义分析
+
+Directus 权限系统中有两种不同的权限拒绝语义，对应不同的场景和行为：
+
+#### 2.4.1 显式请求未授权字段：报错行为
+
+**触发条件**：用户请求的字段不在任何权限规则的 `fields` 列表中，且没有 `*` 通配符权限。
+
+**代码位置**：`api/src/permissions/modules/process-ast/utils/validate-path/validate-path-permissions.ts:4-44`
+
+**核心逻辑**：
+
+```typescript
+// 1. 收集所有允许的字段
+const allowedFields: Set<string> = new Set();
+
+for (const { fields } of permissionsForCollection) {
+  if (!fields) continue;
+  for (const field of fields) {
+    if (field === '*') return; // 通配符，所有字段都允许，直接返回
+    allowedFields.add(field);
+  }
+}
+
+// 2. 检查请求的字段是否都在允许列表中
+const requestedFields = Array.from(fields);
+const forbiddenFields = requestedFields.filter((field) => allowedFields.has(field) === false);
+
+if (forbiddenFields.length > 0) {
+  throw createFieldsForbiddenError(path, collection, forbiddenFields);
+}
+```
+
+**错误信息**：
+
+```
+You don't have permission to access field "sensitive_field" in collection "articles" or it does not exist.
+Queried in "root".
+```
+
+**写入操作的相同行为**：
+
+`processPayload`（`api/src/permissions/modules/process-payload/process-payload.ts:29-142`）中也有相同的检查：
+
+```typescript
+if (fieldsAllowed.includes('*') === false) {
+  const fieldsUsed = Object.keys(options.payload);
+  const notAllowed = difference(fieldsUsed, fieldsAllowed);
+  
+  if (notAllowed.length > 0) {
+    throw createFieldsForbiddenError('', options.collection, notAllowed);
+  }
+}
+```
+
+**REST 与 GraphQL 一致性**：
+
+| 接口类型 | 行为 | 原因 |
+|---------|------|------|
+| **REST** | 抛出 `ForbiddenError` (403) | 直接通过 `processAst` 或 `processPayload` 验证 |
+| **GraphQL** | 抛出 `ForbiddenError`（作为 GraphQL 错误返回） | Schema 层不会过滤这种情况，执行时统一验证 |
+
+> **注意**：GraphQL 的 `reduceSchema` 会过滤无权限的集合和字段，但这里讨论的是「有集合权限但无特定字段权限」的情况，这种情况下字段仍会出现在 Schema 中（因为其他规则可能允许），但执行时会被 `validatePathPermissions` 拦截。
+
+#### 2.4.2 条件不满足时的字段可见性变化：返回 NULL
+
+**触发条件**：用户请求的字段在 `fields` 列表中，但数据级过滤条件（`permissions` 属性）不满足。
+
+**代码位置**：
+- `api/src/permissions/modules/process-ast/lib/inject-cases.ts:13-72`
+- `api/src/database/run-ast/utils/apply-case-when.ts:21-59`
+
+**核心逻辑**：
+
+**第一步：识别需要条件保护的字段**（`injectCases`）
+
+```typescript
+// 从权限规则中提取案例和允许字段
+const { cases, caseMap, allowedFields } = getCases(collection, permissions, requestedKeys);
+
+// allowedFields = 来自无数据过滤条件的权限规则的字段
+// 这些字段在任何情况下都可见
+
+// 为每个字段附加 whenCase 条件
+for (const child of children) {
+  const fieldKey = getUnaliasedFieldKey(child);
+  const globalWhenCase = caseMap['*'];
+  const fieldWhenCase = caseMap[fieldKey];
+
+  // 只有当字段不在「无条件允许」列表中时，才需要 CASE WHEN 保护
+  if (!allowedFields.has('*') && !allowedFields.has(fieldKey)) {
+    child.whenCase = [...(globalWhenCase ?? []), ...(fieldWhenCase ?? [])];
+  }
+}
+```
+
+**第二步：生成 CASE WHEN SQL**（`applyCaseWhen`）
+
+```typescript
+export function applyCaseWhen({ columnCases, ... }: ApplyCaseWhenOptions, ...): Knex.Raw {
+  // 应用权限过滤条件到查询的 WHERE 子句
+  applyFilter(knex, schema, caseQuery, { _or: columnCases }, table, aliasMap, cases, permissions);
+
+  // 生成 CASE WHEN 语句
+  // 当条件满足时返回实际值，否则返回 NULL
+  const rawCase = `(CASE WHEN ${sql} THEN ?? END)`;
+  // 相当于：CASE WHEN <conditions> THEN <column> ELSE NULL END
+
+  return knex.raw(rawCase, bindings);
+}
+```
+
+**getCases 的工作原理**（`api/src/permissions/modules/process-ast/lib/get-cases.ts:6-57`）：
+
+```typescript
+export function getCases(collection: string, permissions: Permission[], requestedKeys: string[]) {
+  const permissionsForCollection = permissions.filter((p) => p.collection === collection);
+  const rules = dedupeAccess(permissionsForCollection);
+
+  // rules = [{ rule: Filter, fields: Set<string> }, ...]
+  // 按数据过滤条件分组，相同条件的字段合并
+
+  const cases: Filter[] = [];      // 所有去重后的过滤条件
+  const caseMap: Record<FieldKey, number[]> = {};  // 字段 → 案例索引映射
+
+  for (const { rule, fields } of rules) {
+    if (rule === null) continue;  // 无数据过滤条件的规则不生成案例
+
+    cases.push(rule);
+    const index = cases.length - 1;
+
+    for (const field of fields) {
+      caseMap[field] = [...(caseMap[field] ?? []), index];
+    }
+  }
+
+  // allowedFields = 来自无数据过滤条件的权限规则的字段
+  const allowedFields = new Set(
+    permissionsForCollection
+      .filter((permission) => hasItemPermissions(permission) === false)
+      .map((permission) => permission.fields ?? [])
+      .flat(),
+  );
+
+  return { cases, caseMap, allowedFields };
+}
+```
+
+**hasItemPermissions 判断**（`api/src/permissions/modules/process-ast/utils/has-item-permissions.ts:3-5`）：
+
+```typescript
+export function hasItemPermissions(permission: Permission) {
+  return permission.permissions !== null && Object.keys(permission.permissions).length > 0;
+}
+```
+
+#### 2.4.3 两种拒绝语义的对比
+
+| 维度 | 显式请求未授权字段 | 条件不满足 |
+|------|------------------|-----------|
+| **触发原因** | 字段不在 `fields` 列表中，无任何权限规则允许 | 字段在 `fields` 列表中，但 `permissions` 条件不满足 |
+| **验证时机** | `validatePathPermissions`（查询执行前） | SQL 执行时（CASE WHEN） |
+| **行为** | 抛出 `ForbiddenError` | 返回 `NULL` |
+| **HTTP 状态码** | 403 Forbidden | 200 OK（数据中包含 NULL） |
+| **是否可见** | 不可见（请求被拒绝） | 可见但值为 NULL |
+| **是否可区分** | 可以明确知道「无权限」 | 无法区分「无权限」和「值本身就是 NULL」 |
+
+#### 2.4.4 实际示例
+
+**场景设定**：
+
+`articles` 集合有字段：`id`, `title`, `status`, `author`, `secret_notes`
+
+用户权限规则：
+
+```json
+{
+  "collection": "articles",
+  "action": "read",
+  "fields": ["title", "status", "author"],
+  "permissions": { "status": { "_eq": "published" } }
+}
+```
+
+**示例 1：请求未授权字段**
+
+```
+GET /items/articles?fields=title,secret_notes
+```
+
+**结果**：
+
+```json
+{
+  "errors": [
+    {
+      "message": "You don't have permission to access field \"secret_notes\" in collection \"articles\" or it does not exist.",
+      "extensions": { "code": "FORBIDDEN" }
+    }
+  ]
+}
+```
+
+**示例 2：请求授权字段但部分记录不满足条件**
+
+数据库中的记录：
+
+| id | title | status | author |
+|----|-------|--------|--------|
+| 1 | Article A | published | user1 |
+| 2 | Article B | draft | user2 |
+
+查询：
+
+```
+GET /items/articles?fields=title,status
+```
+
+**结果**：
+
+```json
+{
+  "data": [
+    {
+      "id": 1,
+      "title": "Article A",
+      "status": "published"
+    },
+    {
+      "id": 2,
+      "title": null,
+      "status": null
+    }
+  ]
+}
+```
+
+> **说明**：
+> - 记录 2（status=draft）不满足权限条件，但记录仍被返回
+> - 记录 2 的 `title` 和 `status` 字段被设置为 `NULL`
+> - 这种「静默降级」行为是为了保护隐私，防止通过错误信息推断数据存在性
+
 ---
 
 ## 3. 字段级权限与集合级权限的叠加顺序
