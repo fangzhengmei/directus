@@ -780,6 +780,618 @@ const displayInfo = useExtension('display', display);
 
 **表格布局** (`app/src/layouts/tabular/tabular.vue` 及相关组件) 使用 `RenderDisplay` 组件渲染单元格内容，根据字段的 `meta.display` 和 `meta.display_options` 配置选择合适的展示组件。
 
+### 7.5 Tabular 路径：字段级别展示组件选择与回退
+
+#### 7.5.1 Tabular 路径概览
+
+**Tabular 路径** 是字段级别的展示路径，用于数据表格的单元格渲染。
+
+```
+路径入口：Tabular 布局单元格渲染
+    ↓
+Tabular Header 配置阶段
+    ├─ 从 FieldsStore 获取字段信息
+    ├─ 确定 display = meta.display || getDefaultDisplayForType
+    └─ 构建 header.field 配置
+    ↓
+RenderDisplay 组件渲染阶段
+    ├─ 检查值状态 (null/undefined)
+    ├─ 检查扩展是否存在 (useExtension)
+    ├─ 渲染展示组件
+    └─ 错误边界处理
+```
+
+#### 7.5.2 阶段一：Tabular Header 配置
+
+**Header 构建逻辑** (`app/src/layouts/tabular/index.ts:247-284`)：
+
+```typescript
+const tableHeaders = computed<HeaderRaw[]>({
+    get() {
+        return activeFields.value.map((field) => {
+            return {
+                // ...
+                field: {
+                    // 优先级 1: meta.display 已配置?
+                    //   是 → 使用配置值
+                    //   否 → 调用 getDefaultDisplayForType(field.type)
+                    display: field.meta?.display || getDefaultDisplayForType(field.type),
+                    displayOptions: field.meta?.display_options,
+                    interface: field.meta?.interface,
+                    interfaceOptions: field.meta?.options,
+                    type: field.type,
+                    field: field.field,
+                    collection: field.collection,
+                },
+                // ...
+            } as HeaderRaw;
+        });
+    },
+});
+```
+
+**阶段一决策优先级（display 确定）**：
+
+```
+字段 Field 对象
+    │
+    ├─ meta.display !== null && meta.display !== undefined?
+    │   ├─ 是 → display = meta.display (用户配置)
+    │   └─ 否 → display = getDefaultDisplayForType(field.type) (系统默认)
+    │
+    └─ display 确定完成 → 传递给 RenderDisplay
+```
+
+**默认展示组件映射表** (`app/src/utils/get-default-display-for-type.ts:3-33`)：
+
+| Directus 类型 | 默认 display |
+|--------------|-------------|
+| `alias`, `binary`, `json`, `unknown`, `geometry*` | `'raw'` |
+| `boolean` | `'boolean'` |
+| `date`, `dateTime`, `time`, `timestamp` | `'datetime'` |
+| `csv` | `'labels'` |
+| `string`, `text`, `uuid`, `bigInteger`, `integer`, `float`, `decimal`, `hash` | `'formatted-value'` |
+
+#### 7.5.3 阶段二：RenderDisplay 组件渲染
+
+**RenderDisplay 组件** (`app/src/views/private/components/render-display.vue:1-49`)：
+
+```typescript
+// 输入参数
+const props = defineProps<{
+    display: string | null;       // 来自阶段一的结果
+    options?: Record<string, unknown>;
+    value?: any;
+    type: string;
+    collection: string;
+    field: string;
+}>();
+
+// 步骤 1: 检查扩展是否存在
+const displayInfo = useExtension('display', display);
+```
+
+**RenderDisplay 完整决策链（含所有回退）**：
+
+```
+RenderDisplay(props: { display, value, ... })
+    │
+    ├─ 优先级 1: 检查值状态
+    │   ├─ value === null || value === undefined?
+    │   │   └─ 是 → ValueNull 组件 (显示 "--")
+    │   │
+    │   └─ 值有效 → 继续
+    │
+    ├─ 优先级 2: 检查展示扩展是否存在
+    │   ├─ displayInfo = useExtension('display', display)
+    │   │
+    │   └─ displayInfo === null (扩展未注册)?
+    │       └─ 是 → VTextOverflow (显示原始值字符串)
+    │
+    ├─ 优先级 3: 渲染展示组件
+    │   └─ VErrorBoundary 包裹
+    │       │
+    │       ├─ 渲染成功
+    │       │   └─ 展示组件正常渲染 (display-{id})
+    │       │
+    │       └─ 渲染失败 (VErrorBoundary 捕获异常)
+    │           └─ fallback → VTextOverflow (显示原始值字符串)
+    │
+    └─ 渲染完成
+```
+
+**Tabular 路径优先级与回退总结表**：
+
+| 优先级 | 条件 | 结果 | 组件/行为 |
+|-------|------|------|----------|
+| **P1** | `value === null \|\| undefined` | ValueNull | `<ValueNull>` → "--" |
+| **P2** | `displayInfo === null` (扩展不存在) | 原始值 | `<VTextOverflow :text="value">` |
+| **P3** | 扩展存在且渲染成功 | 展示组件 | `<component :is="display-${display}">` |
+| **P4 (fallback)** | 渲染过程中抛出异常 | 原始值 | `VErrorBoundary` → `<VTextOverflow>` |
+
+**关键注意点**：
+- `display = 'raw'` 在 Tabular 路径中**不会**被特殊处理，仍然会经过 `useExtension` 检查
+- `raw` 展示组件实际存在（内置扩展），所以会正常渲染
+- 只有当扩展**完全不存在**时才会触发 P2 回退
+
+#### 7.5.4 Tabular 路径端到端示例
+
+```
+场景：Tabular 表格中一个类型为 string、配置了 display='formatted-value' 的字段
+值为 "Hello World"
+
+1. FieldsStore.hydrate() 从 API 加载字段
+   → field.meta.display = 'formatted-value'
+
+2. Tabular 构建 header
+   → display = 'formatted-value' (meta.display 已配置)
+   → displayInfo = useExtension('display', 'formatted-value')
+   → displayInfo !== null (formatted-value 是内置展示组件)
+
+3. RenderDisplay 渲染
+   → value = "Hello World" (不是 null)
+   → displayInfo !== null
+   → 渲染 display-formatted-value 组件
+   → 结果：格式化后的值 "Hello World"
+
+异常场景 1：display = 'non-existent-display'
+   → displayInfo === null
+   → VTextOverflow: 显示原始值 "Hello World"
+
+异常场景 2：display = 'formatted-value' 但组件内部报错
+   → VErrorBoundary 捕获
+   → fallback: VTextOverflow 显示原始值 "Hello World"
+
+异常场景 3：value = null
+   → ValueNull 组件: 显示 "--"
+```
+
+---
+
+### 7.6 RenderTemplate 路径：集合级别展示模板选择与回退
+
+#### 7.6.1 RenderTemplate 路径概览
+
+**RenderTemplate 路径** 是集合级别的展示路径，用于关系字段预览、搜索结果、页面标题等场景。
+
+```
+路径入口：关系字段预览 / 页面标题 / 搜索结果
+    ↓
+useTemplateData 获取模板和数据
+    ├─ 确定 template = props.template || collection.meta.display_template
+    ├─ 解析模板字段
+    └─ 获取数据
+    ↓
+RenderTemplate 组件渲染
+    ├─ 解析模板 ({{field1}} - {{field2}})
+    ├─ 为每个模板变量确定 display
+    ├─ 检查特殊情况 (raw, null 等)
+    └─ 渲染展示组件或回退
+```
+
+#### 7.6.2 阶段一：模板确定与数据获取
+
+**useTemplateData** (`app/src/composables/use-template-data.ts:16-100`)：
+
+```typescript
+// 模板选择优先级
+const template = computed(() => 
+    options?.template?.value ??                  // P1: 组件传入的 template prop
+    collection.value?.meta?.display_template ??  // P2: 集合配置的 display_template
+    null                                          // P3: 无模板
+);
+
+// 从模板中提取字段
+const templateFields = computed(() => {
+    if (!template.value) return null;
+    return getFieldsFromTemplate(template.value);  // 解析 "{{name}} - {{code}}" → ['name', 'code']
+});
+
+// 获取数据
+async function fetchTemplateValues() {
+    const item = await sdk.request<Item>(
+        requestEndpoint(endpoint, {
+            params: {
+                fields: adjustFieldsForDisplays(templateFields.value, collection),
+            },
+        }),
+    );
+    itemData.value = item;
+}
+```
+
+**模板获取优先级**：
+
+```
+需要展示一条记录的标题
+    │
+    ├─ 调用方传入 template prop?
+    │   ├─ 是 → 使用传入的模板 (P1)
+    │   └─ 否 → 继续
+    │
+    ├─ collection.meta.display_template 已配置?
+    │   ├─ 是 → 使用集合配置 (P2)
+    │   └─ 否 → 无模板 (P3)
+    │
+    └─ 模板确定 → 传递给 RenderTemplate
+```
+
+#### 7.6.3 阶段二：RenderTemplate 模板解析与展示组件确定
+
+**RenderTemplate 组件** (`app/src/views/private/components/render-template.vue:67-139`)：
+
+```typescript
+const parts = computed(() =>
+    props.template
+        .split(regex)  // "{{name}} - {{code}}" → ["", "{{name}}", " - ", "{{code}}", ""]
+        .filter((p) => p)
+        .map((part) => {
+            // 静态文本部分（非 {{...}}）
+            if (part.startsWith('{{') === false) return [part];
+
+            // 模板变量部分：{{fieldName}}
+            const fieldKey = part.replace(/{{/g, '').replace(/}}/g, '').trim();
+            
+            // 步骤 1: 获取值（支持嵌套路径）
+            let value = getNestedValues(props.item, fieldKey);
+            
+            // 步骤 2: 获取字段信息
+            let field: Field | null = fieldsStore.getField(props.collection!, fieldKey);
+
+            // ========== 模板变量决策链开始 ==========
+            
+            // 优先级 RT1: 字段信息不存在
+            if (!field) return value;  // 直接返回原始值
+
+            // 步骤 3: 确定展示组件 ID
+            const component = field?.meta?.display ||          // RT2a: meta.display
+                            getDefaultDisplayForType(field.type); // RT2b: 默认 display
+            const options = field?.meta?.display_options;
+
+            // 优先级 RT3: 特殊处理 'raw' 展示组件
+            // 与 Tabular 不同，RenderTemplate 会跳过 'raw' 的组件渲染
+            if (component === 'raw') return value;  // 直接返回原始值
+
+            // 步骤 4: 检查展示扩展是否存在
+            const displayInfo = useExtension(
+                'display',
+                computed(() => component ?? null),
+            );
+
+            // 优先级 RT4: 扩展不存在
+            if (!displayInfo.value) return value;  // 直接返回原始值
+
+            // 步骤 5: 构建展示组件配置（支持数组值的智能处理）
+            if (['related-values', 'formatted-value', 'formatted-json-value', 'translations']
+                 .includes(component)) {
+                // 数组友好组件：整个数组作为 value
+                return [{
+                    component, options, value,
+                    // ... 其他属性
+                }];
+            }
+            
+            // 其他组件：为数组中每个值创建独立配置
+            return value.map((v) => ({
+                component,
+                options: field.meta?.display_options,
+                value: v,
+                // ... 其他属性
+            }));
+        })
+        .map((p) => p ?? null),
+);
+```
+
+#### 7.6.4 阶段三：RenderTemplate 模板渲染
+
+**模板渲染逻辑** (`app/src/views/private/components/render-template.vue:142-171`)：
+
+```vue
+<template>
+    <div class="render-template">
+        <template v-for="(part, index) in parts" :key="index">
+            <template v-for="(subPart, subIndex) in part" :key="subIndex">
+                <VErrorBoundary>
+                    <!-- 优先级 RT5: 值为 null -->
+                    <ValueNull v-if="subPart === null || 
+                                    (typeof subPart === 'object' && subPart.value === null)" />
+                    
+                    <!-- 优先级 RT6: 渲染展示组件 -->
+                    <template v-else-if="subPart?.component">
+                        <component
+                            :is="`display-${subPart.component}`"
+                            v-bind="subPart.options"
+                            :value="subPart.value"
+                            :type="subPart.type"
+                            :collection="subPart.collection"
+                            :field="subPart.field"
+                        />
+                    </template>
+                    
+                    <!-- 静态文本或原始值 -->
+                    <span v-else-if="typeof subPart === 'string'">
+                        {{ translate(subPart) }}
+                    </span>
+                    <span v-else>{{ subPart }}</span>
+                    
+                    <!-- 优先级 RT7: 渲染错误 fallback -->
+                    <template #fallback>
+                        <span>{{ subPart?.value || subPart }}</span>
+                    </template>
+                </VErrorBoundary>
+            </template>
+        </template>
+    </div>
+</template>
+```
+
+#### 7.6.5 RenderTemplate 路径完整决策链
+
+**模板变量决策链（单个 `{{fieldName}}`）**：
+
+```
+模板变量 {{fieldName}}
+    │
+    ├─ RT1: 字段信息不存在 (field === null)?
+    │   └─ 是 → 原始值 (直接显示 value)
+    │
+    ├─ 确定展示组件 ID
+    │   ├─ RT2a: meta.display 已配置? → 使用配置值
+    │   └─ RT2b: 否则 → getDefaultDisplayForType(field.type)
+    │
+    ├─ RT3: component === 'raw'?
+    │   └─ 是 → 原始值 (跳过组件渲染，直接返回 value)
+    │
+    ├─ RT4: 展示扩展不存在 (displayInfo === null)?
+    │   └─ 是 → 原始值 (直接显示 value)
+    │
+    └─ 进入渲染阶段
+        │
+        ├─ RT5: value === null?
+        │   └─ 是 → ValueNull 组件
+        │
+        ├─ RT6: 渲染展示组件
+        │   └─ 成功 → 展示组件正常渲染
+        │
+        └─ RT7: 渲染失败 (VErrorBoundary 捕获)?
+            └─ 是 → fallback: 原始值 ({{ subPart?.value || subPart }})
+```
+
+**RenderTemplate 路径优先级与回退总结表**：
+
+| 优先级 | 条件 | 结果 | 行为 |
+|-------|------|------|------|
+| **RT1** | `field === null` (字段不存在) | 原始值 | `return value` |
+| **RT2** | `component = meta.display \|\| getDefaultDisplayForType` | 确定 display ID | 不渲染，仅确定 |
+| **RT3** | `component === 'raw'` | 原始值 | `return value` (跳过组件) |
+| **RT4** | `displayInfo === null` (扩展不存在) | 原始值 | `return value` |
+| **RT5** | `subPart === null \|\| subPart.value === null` | ValueNull | `<ValueNull>` |
+| **RT6** | 扩展存在且渲染成功 | 展示组件 | `<component :is="display-${component}">` |
+| **RT7 (fallback)** | 渲染过程中抛出异常 | 原始值 | `{{ subPart?.value \|\| subPart }}` |
+
+**RenderTemplate 与 Tabular 的关键差异**：
+
+| 差异点 | Tabular (RenderDisplay) | RenderTemplate |
+|--------|------------------------|---------------|
+| **`component = 'raw'`** | 正常渲染 `display-raw` 组件 | 直接返回原始值，跳过组件 |
+| **扩展不存在时** | VTextOverflow 组件 | 直接返回原始值数组 |
+| **渲染错误 fallback** | VTextOverflow 组件 | `{{ subPart?.value }}` 模板插值 |
+| **数组值处理** | 不处理，依赖展示组件 | 智能拆分：数组友好组件 vs 逐值 |
+| **静态文本** | N/A（单字段） | 支持：`"Name: " + {{name}}` |
+
+#### 7.6.6 RenderTemplate 路径端到端示例
+
+```
+场景：集合 articles，display_template = "{{title}} - {{status}}"
+记录数据：{ title: "Hello", status: "published" }
+
+1. useTemplateData 确定模板
+   → template = collection.meta.display_template = "{{title}} - {{status}}"
+
+2. RenderTemplate 解析模板
+   → parts = ["{{title}}", " - ", "{{status}}"]
+
+3. 处理 {{title}}
+   → field = fieldsStore.getField('articles', 'title')
+   → field.meta.display = null
+   → component = getDefaultDisplayForType('string') = 'formatted-value'
+   → component !== 'raw'
+   → displayInfo = useExtension('display', 'formatted-value') !== null
+   → 构建配置: [{ component: 'formatted-value', value: "Hello" }]
+
+4. 处理 " - "
+   → 静态文本，直接返回
+
+5. 处理 {{status}}
+   → 类似步骤，构建配置: [{ component: 'formatted-value', value: "published" }]
+
+6. 渲染
+   → 结果："Hello" + " - " + "published"
+   → 显示："Hello - published"
+
+特殊场景 1：display = 'raw'
+   → RT3: 直接返回原始值，不渲染组件
+
+特殊场景 2：display = 'non-existent'
+   → RT4: displayInfo === null → 直接返回原始值
+
+特殊场景 3：value = null
+   → RT5: ValueNull 组件显示 "--"
+```
+
+---
+
+### 7.7 两条路径对比与端到端数据流
+
+#### 7.7.1 路径对比总表
+
+| 维度 | Tabular 路径 | RenderTemplate 路径 |
+|------|-------------|-------------------|
+| **触发场景** | 数据表格单元格 | 关系预览、搜索结果、页面标题 |
+| **配置级别** | 字段级别 (`field.meta.display`) | 集合级别 (`collection.meta.display_template`) |
+| **入口组件** | `RenderDisplay` | `RenderTemplate` |
+| **展示组件确定** | `display = meta.display \|\| getDefaultDisplayForType` | 每个模板变量独立确定 |
+| **`'raw'` 处理** | 正常渲染组件 | 直接返回值，跳过组件 |
+| **扩展不存在** | `VTextOverflow` | 直接返回原始值 |
+| **渲染错误 fallback** | `VTextOverflow` | 模板插值 `{{ value }}` |
+| **ValueNull** | 检查 `value === null` | 检查 `subPart === null` |
+
+#### 7.7.2 端到端数据流：从 Stores 到渲染
+
+**完整数据流（以 Tabular 路径为例）**：
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+阶段 1: 应用启动 - 数据加载
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+后端数据库
+  ├─ directus_fields 表: 存储字段元数据 (display, display_options)
+  ├─ directus_relations 表: 存储关系定义
+  └─ directus_collections 表: 存储集合元数据 (display_template)
+       ↓
+API /fields 端点
+       ↓
+前端 FieldsStore.hydrate()
+  ├─ GET /fields
+  ├─ 解析响应 → Field[]
+  └─ 存储到 Pinia: fields.value = [...fieldsRaw.map(parseField)]
+
+API /relations 端点
+       ↓
+前端 RelationsStore.hydrate()
+  ├─ GET /relations
+  ├─ 解析响应 → Relation[]
+  └─ 存储到 Pinia: relations.value = response.data.data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+阶段 2: 展示组件 ID 确定
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tabular 布局初始化
+  ├─ activeFields = 用户选择的字段列表
+  │
+  └─ 构建 tableHeaders
+       ├─ 遍历 activeFields
+       ├─ field = fieldsStore.getField(collection, fieldKey)
+       ├─ display = field.meta?.display || getDefaultDisplayForType(field.type)
+       └─ header.field = { display, displayOptions, type, ... }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+阶段 3: 渲染决策
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RenderDisplay 组件
+  ├─ props: { display, value, type, collection, field }
+  │
+  ├─ P1: value === null || undefined?
+  │   └─ 是 → <ValueNull /> → "--"
+  │
+  ├─ displayInfo = useExtension('display', display)
+  │   └─ 在扩展注册表中查找:
+  │      extensions.displays.value.find(({ id }) => id === display)
+  │
+  ├─ P2: displayInfo === null?
+  │   └─ 是 → <VTextOverflow :text="value" /> → 原始值
+  │
+  └─ P3: 渲染展示组件
+       ├─ <component :is="`display-${display}`" ... />
+       │
+       └─ 渲染异常?
+           └─ VErrorBoundary fallback
+               → <VTextOverflow :text="value" />
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+阶段 4: 最终输出
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+正常路径:
+  display='formatted-value' → display-formatted-value 组件 → 格式化后的值
+
+ValueNull 路径:
+  value=null → <ValueNull /> → "--"
+
+扩展不存在路径:
+  display='unknown-display' → displayInfo=null → <VTextOverflow /> → 原始值
+
+渲染错误路径:
+  display='formatted-value' → 组件报错 → fallback → <VTextOverflow /> → 原始值
+```
+
+**完整数据流（以 RenderTemplate 路径为例）**：
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+阶段 1: 模板和数据获取
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+useTemplateData(collection, primaryKey)
+  ├─ template = props.template || collection.meta.display_template || null
+  │
+  ├─ templateFields = getFieldsFromTemplate(template)
+  │   → "{{title}} - {{author.name}}" → ['title', 'author.name']
+  │
+  ├─ fields = adjustFieldsForDisplays(templateFields, collection)
+  │
+  └─ 调用 API 获取数据
+       GET /items/collection/123?fields=title,author.*
+       ↓
+       itemData = { title: "Hello", author: { name: "John" } }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+阶段 2: 模板解析
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RenderTemplate 组件
+  ├─ props: { template, collection, item }
+  │
+  └─ parts = template.split(/({{.*?}})/g)
+       → ["", "{{title}}", " - ", "{{author.name}}", ""]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+阶段 3: 每个模板变量的决策
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+处理 "{{title}}":
+  ├─ RT1: field = fieldsStore.getField(collection, 'title') → 存在
+  ├─ RT2: component = meta.display || getDefaultDisplayForType('string') → 'formatted-value'
+  ├─ RT3: component === 'raw'? → 否
+  ├─ RT4: displayInfo = useExtension('display', 'formatted-value') → 存在
+  └─ 构建配置 → 进入渲染阶段
+
+处理 " - ":
+  └─ 静态文本 → 直接显示
+
+处理 "{{author.name}}":
+  ├─ RT1: field = fieldsStore.getField(collection, 'author.name') → 可能不存在
+  └─ RT1 触发 → 直接返回原始值 "John"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+阶段 4: 渲染
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+渲染 parts:
+  ├─ "{{title}}" → display-formatted-value 组件 → "Hello"
+  ├─ " - " → 静态文本 → " - "
+  └─ "{{author.name}}" → 原始值 → "John"
+
+最终输出: "Hello - John"
+```
+
+#### 7.7.3 关键组件职责
+
+| 组件/Store | 职责 | 关键代码位置 |
+|-----------|------|-------------|
+| **FieldsStore** | 存储字段元数据，提供 `getField()` 查询 | `app/src/stores/fields.ts` |
+| **RelationsStore** | 存储关系定义，提供 `getRelationsForField()` | `app/src/stores/relations.ts` |
+| **useExtension** | 在扩展注册表中查找扩展配置 | `app/src/composables/use-extension.ts` |
+| **RenderDisplay** | Tabular 路径的渲染决策入口 | `app/src/views/private/components/render-display.vue` |
+| **RenderTemplate** | 模板解析 + 渲染决策 | `app/src/views/private/components/render-template.vue` |
+| **ValueNull** | 显示 `--` 表示空值 | `app/src/views/private/components/value-null.vue` |
+| **VTextOverflow** | 显示原始值，处理长文本溢出 | `app/src/components/v-text-overflow.vue` |
+| **VErrorBoundary** | 捕获组件渲染错误，提供 fallback | `app/src/components/v-error-boundary.vue` |
+
 ## 8. 完整数据流总结
 
 ### 8.1 字段配置数据流
