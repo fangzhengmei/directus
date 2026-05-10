@@ -815,7 +815,7 @@ export function mergeFields(fieldsA: string[] | null, fieldsB: string[] | null, 
 
 ## 4. GraphQL 与 REST 共用权限核心的机制
 
-### 4.1 架构概览
+### 5.1 架构概览
 
 Directus 采用**统一服务层**设计，REST 和 GraphQL 只是不同的「入口」，最终都调用相同的服务层和权限核心：
 
@@ -1133,9 +1133,9 @@ processAst()  ← 权限核心处理
 runAst() → SQL 查询
 ```
 
-### 4.5 权限调用流程图
+### 5.5 权限调用流程图
 
-#### 4.5.1 REST 读取流程
+#### 5.5.1 REST 读取流程
 
 ```
 GET /items/articles?fields=title,author&filter[status][_eq]=published
@@ -1235,7 +1235,7 @@ ItemsService.updateOne(123, data)
 | 项目验证 | `api/src/permissions/modules/validate-access/lib/validate-item-access.ts:44` | `validateItemAccess()` |
 | 载荷处理 | `api/src/permissions/modules/process-payload/process-payload.ts:29` | `processPayload()` |
 
-#### 4.6.3 GraphQL Schema 权限
+#### 5.6.3 GraphQL Schema 权限
 
 | 层级 | 文件路径 | 关键函数 |
 |------|----------|----------|
