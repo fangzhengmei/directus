@@ -101,6 +101,200 @@ if (special) {
    - 关联到 `directus_files` → `files` (多文件)
    - 其他 → `m2m` (Many-to-Many)
 
+### 3.3 双关系字段的精确决策链
+
+**双关系字段决策流程图** (`app/src/utils/get-local-type.ts:34-61`)：
+
+```
+字段有 2 个关系？
+    │
+    ├─ meta.special 包含 'translations'?
+    │   └─ 是 → translations
+    │
+    ├─ meta.special 包含 'm2a'?
+    │   └─ 是 → m2a
+    │
+    ├─ 当前字段是关系的多端 (many side)?
+    │   └─ 是 → m2o
+    │
+    ├─ 关联到 directus_files?
+    │   ├─ collection != directus_files 且 1 个关系关联 → files
+    │   └─ 2 个关系都关联 → files (自关联多文件)
+    │
+    └─ 其他 → m2m
+```
+
+**决策逻辑代码分析**：
+
+```typescript
+if (relations.length === 2) {
+    // 优先级 1: special 标记优先
+    if ((fieldInfo.meta?.special || []).includes('translations')) {
+        return 'translations';
+    }
+
+    if ((fieldInfo.meta?.special || []).includes('m2a')) {
+        return 'm2a';
+    }
+
+    // 优先级 2: 当前字段在多端 (many side) → m2o
+    // 这种情况常见于 M2M 关系中通过中间表访问多对一端
+    const relationForCurrent = getRelation(relations, collection, field);
+    if (relationForCurrent?.collection === collection && 
+        relationForCurrent?.field === field) {
+        return 'm2o';
+    }
+
+    // 优先级 3: 关联到 directus_files → files
+    const directusFilesRelationsCount = relations.filter(
+        (relation) => relation.related_collection === 'directus_files',
+    ).length;
+
+    const isRelationToDirectusFiles = collection !== 'directus_files' && 
+                                     directusFilesRelationsCount === 1;
+    const isSelfRelationToDirectusFiles = directusFilesRelationsCount === 2;
+
+    if (isRelationToDirectusFiles || isSelfRelationToDirectusFiles) {
+        return 'files';
+    }
+    
+    // 优先级 4: 默认 m2m
+    else {
+        return 'm2m';
+    }
+}
+```
+
+**关键判定条件详解**：
+
+| 条件 | 判定逻辑 | 示例场景 |
+|------|---------|---------|
+| `special.includes('translations')` | 字段被标记为多语言翻译字段 | `directus_languages` 表的多语言支持 |
+| `special.includes('m2a')` | 字段被标记为多对任意 | 动态关联到多个不同集合 |
+| `relation.collection === collection && relation.field === field` | 当前字段存储外键，在关系的多端 | 中间表的外键字段 |
+| `related_collection === 'directus_files'` | 关系目标是文件管理表 | 多文件上传字段 |
+| 以上都不满足 | 标准多对多关系 | 文章 ↔ 标签的多对多 |
+
+### 3.4 数据库类型修正条件
+
+**后端类型修正逻辑** (`api/src/utils/get-local-type.ts:134-150`)：
+
+在基础映射之后，还有三个条件修正类型：
+
+#### 3.4.1 PostgreSQL numeric 类型修正
+
+```typescript
+/** Handle Postgres numeric decimals */
+if (dataType === 'numeric' && 
+    column.numeric_precision !== null && 
+    column.numeric_scale !== null) {
+    return 'decimal';
+}
+```
+
+**修正条件**：
+- 数据库类型为 `numeric`
+- `numeric_precision` 不为 `null`（有精度定义）
+- `numeric_scale` 不为 `null`（有小数位数定义）
+
+**修正前**：
+- 基础映射：`numeric` → `integer`（`localTypeMap` 第 36 行）
+
+**修正后**：
+- 有 precision 和 scale → `decimal`
+
+**应用场景**：
+```sql
+-- PostgreSQL
+-- 以下会被修正为 decimal
+ALTER TABLE products ADD COLUMN price NUMERIC(10, 2);
+ALTER TABLE products ADD COLUMN discount NUMERIC(5, 4);
+
+-- 以下保持为 integer（无 precision/scale）
+ALTER TABLE products ADD COLUMN stock NUMERIC;
+```
+
+#### 3.4.2 MS SQL varchar(MAX) / nvarchar(MAX) 修正
+
+```typescript
+/** Handle MS SQL varchar(MAX) and nvarchar(MAX) types */
+if (
+    (column.data_type === 'nvarchar' || column.data_type === 'varchar') &&
+    (column.max_length === -1 || column.max_length === null)
+) {
+    return 'text';
+}
+```
+
+**修正条件**：
+- 数据库类型为 `varchar` 或 `nvarchar`
+- `max_length` 为 `-1` 或 `null`（表示 MAX）
+
+**修正前**：
+- 基础映射：`varchar` → `string`, `nvarchar` → `string`（`localTypeMap` 第 19、22 行）
+
+**修正后**：
+- `varchar(MAX)` / `nvarchar(MAX)` → `text`
+
+**应用场景**：
+```sql
+-- MS SQL Server
+-- 以下会被修正为 text
+ALTER TABLE articles ADD COLUMN content NVARCHAR(MAX);
+ALTER TABLE articles ADD COLUMN excerpt VARCHAR(MAX);
+
+-- 以下保持为 string（有长度限制）
+ALTER TABLE articles ADD COLUMN title NVARCHAR(200);
+```
+
+#### 3.4.3 CockroachDB 64 位整数修正
+
+```typescript
+/** Handle CockroachDB 64-bit integers (reported as 'integer' with precision 64) */
+if ((dataType === 'integer' || dataType === 'int') && 
+    column.numeric_precision === 64) {
+    return 'bigInteger';
+}
+```
+
+**修正条件**：
+- 数据库类型为 `integer` 或 `int`
+- `numeric_precision` 等于 `64`
+
+**修正前**：
+- 基础映射：`integer` → `integer`（`localTypeMap` 第 10 行）
+
+**修正后**：
+- 精度为 64 的整数 → `bigInteger`
+
+**应用场景**：
+```sql
+-- CockroachDB
+-- 以下会被修正为 bigInteger
+CREATE TABLE orders (
+    id INT8 PRIMARY KEY,  -- INT8 在 CockroachDB 中是 64 位整数
+    amount INTEGER        -- 但如果 precision 为 64，也会被修正
+);
+```
+
+**类型修正优先级**：
+
+```
+原始数据库类型
+    ↓
+localTypeMap 基础映射
+    ↓
+special 字段覆盖（cast-json, hash, cast-csv, uuid, cast-timestamp, cast-datetime, geometry）
+    ↓
+PostgreSQL numeric 精度修正
+    ↓
+MS SQL varchar(MAX) 修正
+    ↓
+CockroachDB 64-bit 整数修正
+    ↓
+最终 Directus 类型
+```
+
 ## 4. 接口与展示组件系统
 
 ### 4.1 接口组件定义
