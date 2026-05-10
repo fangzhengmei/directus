@@ -1392,6 +1392,410 @@ RenderTemplate 组件
 | **VTextOverflow** | 显示原始值，处理长文本溢出 | `app/src/components/v-text-overflow.vue` |
 | **VErrorBoundary** | 捕获组件渲染错误，提供 fallback | `app/src/components/v-error-boundary.vue` |
 
+---
+
+### 7.8 边界场景分析：回退链路的潜在问题
+
+#### 7.8.1 VErrorBoundary 工作原理
+
+**VErrorBoundary 组件** (`app/src/components/v-error-boundary.vue:1-42`)：
+
+```typescript
+const error = ref<Error | null>(null);
+const hasError = computed(() => !!error.value);
+
+onErrorCaptured((err, vm, info) => {
+    error.value = err;      // 捕获错误并标记 hasError = true
+    console.warn(`[${source}-error] ${info}`);
+    console.warn(err);
+    if (props.stopPropagation) return false;
+});
+```
+
+**模板渲染逻辑**：
+```vue
+<template>
+    <!-- hasError = true → 渲染 fallback slot -->
+    <template v-if="hasError">
+        <template v-if="$slots.fallback">
+            <slot name="fallback" v-bind="{ error }" />
+        </template>
+    </template>
+    
+    <!-- hasError = false → 正常渲染默认 slot -->
+    <slot v-else></slot>
+</template>
+```
+
+**VErrorBoundary 触发条件**：
+- 子组件的 `setup()` 函数抛出异常
+- 子组件的渲染函数抛出异常
+- 子组件的生命周期钩子抛出异常
+- 子组件的 watcher 回调抛出异常
+
+**VErrorBoundary 不触发的场景**：
+- 事件处理器中的错误（需要单独 try-catch）
+- 异步组件的加载错误
+- 服务端渲染错误
+- 子组件自己捕获并处理的错误
+
+#### 7.8.2 RenderTemplate 的 subPart 数据结构分析
+
+**RenderTemplate 中的 parts 构建** (`app/src/views/private/components/render-template.vue:67-139`)：
+
+`parts` 是一个二维数组，每个 `part` 对应模板中的一个片段（静态文本或模板变量）：
+
+```
+模板: "{{name}} - {{status}}"
+      ├─ "{{name}}"     → 模板变量
+      ├─ " - "          → 静态文本
+      └─ "{{status}}"   → 模板变量
+
+parts = [
+    [ /* "{{name}}" 的处理结果 */ ],
+    [ /* " - " 的处理结果 */ ],
+    [ /* "{{status}}" 的处理结果 */ ]
+]
+```
+
+**subPart 的 5 种可能类型**：
+
+| subPart 类型 | 产生条件 | 结构示例 |
+|-------------|---------|---------|
+| **字符串** | 静态文本片段 | `" - "` |
+| **原始值数组** | `!field` 或 `component='raw'` 或 `!displayInfo` | `["Hello"]` |
+| **展示配置对象** | 数组友好组件（formatted-value 等） | `{ component: 'formatted-value', value: "Hello", ... }` |
+| **展示配置对象数组** | 其他组件，逐值处理 | `[{ component: 'boolean', value: true, ... }]` |
+| **null** | `.map((p) => p ?? null)` 的兜底 | `null` |
+
+**完整数据结构示例**：
+
+```typescript
+// 模板: "{{name}} - {{active}}"
+// item: { name: "Hello", active: false }
+// name 字段: display='formatted-value', type='string'
+// active 字段: display='boolean', type='boolean'
+
+parts = [
+    // "{{name}}" 的处理结果
+    [
+        {
+            component: 'formatted-value',
+            options: undefined,
+            value: ["Hello"],           // 注意：value 是数组！
+            interface: 'input',
+            // ... 其他属性
+        }
+    ],
+    
+    // " - " 的处理结果
+    [
+        " - "                          // 静态文本，字符串类型
+    ],
+    
+    // "{{active}}" 的处理结果
+    [
+        {
+            component: 'boolean',
+            options: undefined,
+            value: false,              // 注意：单个值被展开
+            interface: 'boolean',
+            // ... 其他属性
+        }
+    ]
+]
+```
+
+**关键细节：value 的包装与展开**：
+
+```typescript
+// 步骤 1: getNestedValues 总是返回数组
+let value = getNestedValues(props.item, fieldKey);
+// value = ["Hello"] 或 [false] 或 [null]
+
+// 步骤 2: 数组友好组件 → 整个数组作为 value 传入
+if (['related-values', 'formatted-value', ...].includes(component)) {
+    return [{
+        component,
+        value,              // value 保持数组: ["Hello"]
+        // ...
+    }];
+}
+
+// 步骤 3: 其他组件 → 为数组中每个值创建独立配置
+return value.map((v) => ({
+    component,
+    value: v,              // value 被展开: "Hello", false, null 等
+    // ...
+}));
+```
+
+#### 7.8.3 RenderTemplate VErrorBoundary fallback 的假值问题
+
+**Fallback 代码** (`app/src/views/private/components/render-template.vue:164-166`)：
+
+```vue
+<template #fallback>
+    <span>{{ subPart?.value || subPart }}</span>
+</template>
+```
+
+**问题根源：`||` 运算符的假值语义**
+
+JavaScript 的 `||` 运算符会将以下值视为"假值"：
+- `false`
+- `0`
+- `""` (空字符串)
+- `null`
+- `undefined`
+- `NaN`
+
+**fallback 表达式分析**：
+
+```javascript
+subPart?.value || subPart
+
+// 等价于：
+subPart?.value ? subPart?.value : subPart
+
+// 但由于 || 的假值语义：
+subPart?.value === false    → 被视为假值 → 返回 subPart
+subPart?.value === 0        → 被视为假值 → 返回 subPart
+subPart?.value === ""       → 被视为假值 → 返回 subPart
+```
+
+#### 7.8.4 假值边界场景对照表
+
+| 场景 | 原始 value | subPart 类型 | `subPart?.value` | `subPart?.value \|\| subPart` | 实际显示 | 预期显示 | 偏差？ |
+|------|-----------|-------------|-----------------|------------------------------|---------|---------|--------|
+| **字符串** | `"Hello"` | 对象 | `"Hello"` | `"Hello"` | `Hello` | `Hello` | ❌ 否 |
+| **空字符串** | `""` | 对象 | `""` | `[object Object]` | `[object Object]` | `` | ✅ 是 |
+| **数字** | `42` | 对象 | `42` | `42` | `42` | `42` | ❌ 否 |
+| **数字 0** | `0` | 对象 | `0` | `[object Object]` | `[object Object]` | `0` | ✅ 是 |
+| **布尔 true** | `true` | 对象 | `true` | `true` | `true` | `true` | ❌ 否 |
+| **布尔 false** | `false` | 对象 | `false` | `[object Object]` | `[object Object]` | `false` | ✅ 是 |
+| **null** | `null` | 对象 | `null` | `[object Object]` | `[object Object]` | `--` 或 `null` | ✅ 是 |
+| **数组** | `[1, 2]` | 对象 | `[1, 2]` | `1,2` | `1,2` | `1,2` | 视情况 |
+| **对象** | `{a: 1}` | 对象 | `{a: 1}` | `[object Object]` | `[object Object]` | `[object Object]` | 视情况 |
+
+**详细场景分析**：
+
+**场景 1：布尔字段 false**
+```
+字段: active (type=boolean, display=boolean)
+值: false
+
+正常渲染: display-boolean 组件 → 显示 "No" 或关闭图标
+VErrorBoundary fallback 触发时:
+  subPart?.value = false
+  false || subPart → subPart (对象)
+  {{ subPart }} → "[object Object]"
+实际显示: "[object Object]"
+预期显示: "false" 或 "--"
+偏差: ✅ 存在
+```
+
+**场景 2：数字字段 0**
+```
+字段: count (type=integer, display=formatted-value)
+值: 0
+
+注意：formatted-value 是数组友好组件，value 保持数组
+正常渲染: display-formatted-value 组件 → 显示 "0"
+VErrorBoundary fallback 触发时:
+  subPart?.value = [0]
+  [0] || subPart → [0] (数组在布尔上下文中为真)
+  {{ [0] }} → "0"
+实际显示: "0"
+预期显示: "0"
+偏差: ❌ 不存在（幸运地）
+
+但如果是非数组友好组件:
+  subPart?.value = 0
+  0 || subPart → subPart (对象)
+  {{ subPart }} → "[object Object]"
+实际显示: "[object Object]"
+预期显示: "0"
+偏差: ✅ 存在
+```
+
+**场景 3：空字符串**
+```
+字段: description (type=text, display=formatted-value)
+值: ""
+
+正常渲染: display-formatted-value 组件 → 显示 "" (空)
+VErrorBoundary fallback 触发时:
+  subPart?.value = "" (非数组友好组件) 或 [""] (数组友好)
+  "" || subPart → subPart (对象)
+  {{ subPart }} → "[object Object]"
+实际显示: "[object Object]"
+预期显示: "" 或 "--"
+偏差: ✅ 存在
+```
+
+#### 7.8.5 根因分析
+
+**问题 1：`||` 运算符的语义错误**
+
+```javascript
+// 当前代码
+subPart?.value || subPart
+
+// 问题：JavaScript 逻辑或运算符会将假值视为 false
+// 应该使用空值合并运算符
+subPart?.value ?? subPart
+
+// 或者显式检查
+subPart?.value !== undefined ? subPart?.value : subPart
+```
+
+**问题 2：对象的字符串化**
+
+```vue
+<!-- fallback 中的模板插值 -->
+<span>{{ subPart?.value || subPart }}</span>
+
+<!-- 当 subPart 是对象时 -->
+{{ subPart }} → 调用 Object.prototype.toString() → "[object Object]"
+
+<!-- 期望的行为 -->
+{{ subPart?.value }} → 即使是 false/0/"" 也应该显示实际值
+```
+
+**问题 3：null 值的一致性**
+
+```
+RenderTemplate 中:
+- ValueNull 检查: subPart === null || (typeof subPart === 'object' && subPart.value === null)
+- 但 VErrorBoundary fallback 在 value === null 时也会触发
+- 导致 null 值可能显示 "[object Object]" 而不是 "--"
+```
+
+#### 7.8.6 潜在修复方案
+
+```vue
+<!-- 方案 1：使用空值合并运算符 -->
+<template #fallback>
+    <span>{{ subPart?.value ?? subPart }}</span>
+</template>
+
+<!-- 方案 2：显式检查，同时处理 null -->
+<template #fallback>
+    <ValueNull v-if="subPart === null || (subPart?.value === null)" />
+    <span v-else-if="subPart?.value !== undefined">{{ subPart?.value }}</span>
+    <span v-else>{{ subPart }}</span>
+</template>
+
+<!-- 方案 3：参考 Tabular 的做法，使用 VTextOverflow -->
+<template #fallback>
+    <VTextOverflow :text="subPart?.value ?? subPart" />
+</template>
+```
+
+---
+
+### 7.9 Tabular 与 RenderTemplate 回退行为差异对照
+
+#### 7.9.1 回退机制总览
+
+```
+Tabular 路径 (RenderDisplay):
+    ├─ null 值 → ValueNull ("--")
+    ├─ 扩展不存在 → VTextOverflow (原始值)
+    └─ 渲染错误 → VErrorBoundary fallback → VTextOverflow (原始值)
+
+RenderTemplate 路径:
+    ├─ null 值 → ValueNull ("--")
+    ├─ 扩展不存在 → 原始值数组（直接插值）
+    ├─ component='raw' → 原始值数组（直接插值，跳过组件）
+    └─ 渲染错误 → VErrorBoundary fallback → {{ subPart?.value || subPart }}
+```
+
+#### 7.9.2 详细差异对照
+
+| 维度 | Tabular (RenderDisplay) | RenderTemplate |
+|------|------------------------|---------------|
+| **null 值处理** | 优先级最高，ValueNull 组件 | 优先级在渲染阶段检查 |
+| **扩展不存在** | VTextOverflow 组件，统一处理 | 直接返回原始值数组，模板插值 |
+| **渲染错误 fallback** | VTextOverflow 组件，`:text="value"` | 模板插值 `{{ subPart?.value \|\| subPart }}` |
+| **component='raw'** | 正常渲染 display-raw 组件 | 特殊处理，直接返回值，跳过组件 |
+| **假值 (false/0/\"\")** | VTextOverflow 可以正确显示 | `\|\|` 运算符导致显示偏差 |
+| **对象值** | VTextOverflow 的 `:text` prop 接受对象 | 模板插值调用 `toString()` → "[object Object]" |
+| **数组值** | VTextOverflow 显示 `Array.toString()` | 根据组件类型决定包装或展开 |
+
+#### 7.9.3 假值回退行为对照表
+
+| 值 | Tabular 正常 | Tabular fallback | RenderTemplate 正常 | RenderTemplate fallback |
+|----|-------------|-----------------|--------------------|-----------------------|
+| `"Hello"` | display-formatted-value → "Hello" | VTextOverflow → "Hello" | display-formatted-value → "Hello" | `"Hello"` |
+| `""` | display-formatted-value → "" | VTextOverflow → "" | display-formatted-value → "" | `"[object Object]"` ⚠️ |
+| `42` | display-formatted-value → "42" | VTextOverflow → "42" | display-formatted-value → "42" | `"42"` |
+| `0` | display-formatted-value → "0" | VTextOverflow → "0" | display-formatted-value → "0" | `"[object Object]"` ⚠️ |
+| `true` | display-boolean → "Yes" | VTextOverflow → "true" | display-boolean → "Yes" | `"true"` |
+| `false` | display-boolean → "No" | VTextOverflow → "false" | display-boolean → "No" | `"[object Object]"` ⚠️ |
+| `null` | ValueNull → "--" | ValueNull → "--" | ValueNull → "--" | `"[object Object]"` ⚠️ |
+
+**⚠️ 表示存在显示偏差**
+
+#### 7.9.4 回退行为的设计意图分析
+
+**Tabular 路径的设计意图**：
+- 表格场景需要一致性和可预测性
+- VTextOverflow 提供统一的回退体验
+- 支持长文本溢出处理（ellipsis + tooltip）
+- 假值通过 `:text` prop 正确处理
+
+```typescript
+// VTextOverflow 接受任何类型的 text prop
+interface Props {
+    text?: string | number | boolean | Record<string, any> | Array<any>;
+}
+
+// 模板中直接插值
+<template v-else>{{ text }}</template>
+// Vue 会正确处理 false/0/""
+```
+
+**RenderTemplate 路径的设计意图**：
+- 模板场景需要灵活性
+- 支持静态文本与动态值的混合
+- 数组友好组件的智能处理
+- 但 fallback 实现存在缺陷
+
+#### 7.9.5 建议的一致性改进
+
+**RenderTemplate fallback 改进建议**：
+
+```vue
+<!-- 当前 (有问题) -->
+<template #fallback>
+    <span>{{ subPart?.value || subPart }}</span>
+</template>
+
+<!-- 改进方案 A：使用 VTextOverflow 保持一致性 -->
+<template #fallback>
+    <VTextOverflow :text="subPart?.value ?? subPart" />
+</template>
+
+<!-- 改进方案 B：更精细的控制 -->
+<template #fallback>
+    <ValueNull v-if="subPart === null || subPart?.value === null" />
+    <VTextOverflow v-else :text="subPart?.value ?? subPart" />
+</template>
+```
+
+**改进后的回退行为**：
+
+| 值 | 改进前 | 改进后 |
+|----|--------|--------|
+| `""` | `"[object Object]"` | `""` |
+| `0` | `"[object Object]"` | `"0"` |
+| `false` | `"[object Object]"` | `"false"` |
+| `null` | `"[object Object]"` | `"--"` |
+
+---
+
 ## 8. 完整数据流总结
 
 ### 8.1 字段配置数据流
