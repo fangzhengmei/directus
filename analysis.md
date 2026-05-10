@@ -815,7 +815,7 @@ export function mergeFields(fieldsA: string[] | null, fieldsB: string[] | null, 
 
 ## 4. GraphQL 与 REST 共用权限核心的机制
 
-### 5.1 架构概览
+### 4.1 架构概览
 
 Directus 采用**统一服务层**设计，REST 和 GraphQL 只是不同的「入口」，最终都调用相同的服务层和权限核心：
 
