@@ -830,7 +830,1047 @@ if (key === '_or' && value.some(subFilter => Object.keys(subFilter).length === 0
 | 关联字段权限 | `inject-cases.ts` | M2O L52, O2M L56, A2O L60 |
 | 完全权限检测 | `get-cases.ts` | `allowedFields` L45-50 |
 
-## 12. 总结
+## 12. 权限错误 vs 结果过滤：触发条件详解
+
+Directus 的权限系统采用了**双重策略**来处理权限限制：
+
+| 处理方式 | 触发时机 | 表现形式 |
+|---------|---------|---------|
+| **直接报错 (ForbiddenError)** | 查询解析阶段（SQL 执行前） | HTTP 403 Forbidden，立即终止 |
+| **字段置空 (CASE WHEN NULL)** | SQL 执行阶段 | 无权限字段返回 `null`，其他字段正常 |
+| **结果过滤 (WHERE 条件)** | SQL 执行阶段 | 不符合权限条件的行不返回 |
+
+### 12.1 直接报权限错误的场景
+
+这类错误发生在 `processAst()` 阶段，即在生成 SQL 之前就被拦截。
+
+#### 场景 1：目标集合无任何权限
+
+**触发条件：**
+- 查询路径指向的集合在当前用户权限中完全不存在
+- 包括：`directus_permissions` 表中没有该 `collection + action` 的任何记录
+
+**代码位置：** `validate-path-permissions.ts:10-14`
+
+```typescript
+const permissionsForCollection = permissions.filter(
+    p => p.collection === collection
+);
+
+if (permissionsForCollection.length === 0) {
+    throw createCollectionForbiddenError(path, collection);
+}
+```
+
+**示例：**
+```javascript
+// 用户权限：只有 products 的读取权限
+// 执行查询：查询 categories 集合
+GET /items/categories
+// 结果：403 Forbidden
+// "You don't have permission to access collection 'categories'..."
+```
+
+**在关联查询中的表现：**
+```javascript
+// 查询 products，同时查询其关联的 category
+{
+    "fields": ["id", "name", "category.name"]
+}
+
+// 如果用户没有 categories 集合的读取权限
+// 结果：403 Forbidden
+// 错误信息会包含路径："Queried in 'category'"
+```
+
+#### 场景 2：访问未授权字段
+
+**触发条件：**
+- 有权访问集合，但请求的字段不在权限的 `fields` 配置中
+- 权限的 `fields` 不是 `*`，且不包含请求的字段
+
+**代码位置：** `validate-path-permissions.ts:16-42`
+
+```typescript
+const allowedFields: Set<string> = new Set();
+
+for (const { fields } of permissionsForCollection) {
+    if (!fields) continue;
+    for (const field of fields) {
+        if (field === '*') return;  // 有 * 就完全放行
+        allowedFields.add(field);
+    }
+}
+
+const forbiddenFields = requestedFields.filter(
+    field => allowedFields.has(field) === false
+);
+
+if (forbiddenFields.length > 0) {
+    throw createFieldsForbiddenError(path, collection, forbiddenFields);
+}
+```
+
+**示例：**
+```javascript
+// 用户权限配置
+{
+    "collection": "products",
+    "action": "read",
+    "fields": ["id", "name", "status"],  // 没有 price 字段
+    "permissions": {}
+}
+
+// 执行查询
+GET /items/products?fields=id,name,price
+// 结果：403 Forbidden
+// "You don't have permission to access field 'price'..."
+```
+
+**在关联查询中的表现：**
+```javascript
+// 用户对 categories 只有 id 字段权限
+// 但查询中请求了 category.name
+{
+    "fields": ["id", "category.id", "category.name"]
+}
+// 结果：403 Forbidden
+// "Queried in 'category'"
+```
+
+#### 场景 3：字段/集合不存在
+
+**触发条件：**
+- 请求的集合在 schema 中不存在
+- 请求的字段在集合 schema 中不存在
+
+**代码位置：** `validate-path-existence.ts:4-17`
+
+```typescript
+export function validatePathExistence(path, collection, fields, schema) {
+    const collectionInfo = schema.collections[collection];
+    
+    if (collectionInfo === undefined) {
+        throw createCollectionForbiddenError(path, collection);
+    }
+    
+    const nonExistentFields = requestedFields.filter(
+        field => collectionInfo.fields[field] === undefined
+    );
+    
+    if (nonExistentFields.length > 0) {
+        throw createFieldsForbiddenError(path, collection, nonExistentFields);
+    }
+}
+```
+
+**注意：** 此检查即使对 `admin` 用户和 `accountability = null`（公开访问）也会执行。
+
+#### 场景 4：写入/更新操作的权限验证
+
+**触发条件：**
+- `create`、`update`、`delete` 操作时验证失败
+- 通过 `validateAccess()` 函数执行
+
+**代码位置：** `validate-access.ts:22-57`
+
+```typescript
+export async function validateAccess(options, context) {
+    // 跳过管理员
+    if (options.accountability.admin === true) {
+        return;
+    }
+    
+    let access: boolean;
+    
+    if (options.primaryKeys) {
+        // 有具体主键时，实际查询数据库验证
+        const result = await validateItemAccess(options, context);
+        access = result.accessAllowed;
+    } else {
+        // 无主键时，检查集合级权限
+        access = await validateCollectionAccess(options, context);
+    }
+    
+    if (!access) {
+        throw new ForbiddenError({ ... });
+    }
+}
+```
+
+**关键区别：** 写入操作会实际查询数据库验证行级权限，而非仅在 AST 层面检查。
+
+### 12.2 字段置空的场景
+
+这类处理发生在 SQL 执行阶段，通过 `CASE WHEN ... THEN ... END` 实现。
+
+#### 触发条件
+
+- 有权访问集合（通过了 `validatePathPermissions`）
+- 有权访问字段（`fields` 配置包含该字段）
+- 但**行级权限条件** `permissions` 不为空（不是 `{}` 或 `null`）
+- 当前记录不满足行级权限条件
+
+**核心机制：**
+
+```typescript
+// inject-cases.ts:47-50
+// 只有不完全权限时才设置 whenCase
+if (!allowedFields.has('*') && !allowedFields.has(fieldKey)) {
+    child.whenCase = [...(globalWhenCase ?? []), ...(fieldWhenCase ?? [])];
+}
+
+// get-column-pre-processor.ts:73-92
+if (hasWhenCase) {
+    const columnCases: Filter[] = [];
+    
+    for (const index of fieldNode.whenCase) {
+        columnCases.push(cases[index]!);
+    }
+    
+    // 包裹成 CASE WHEN
+    column = applyCaseWhen({
+        column,
+        columnCases,
+        ...
+    });
+}
+
+// apply-case-when.ts:51
+let rawCase = `(CASE WHEN ${sql} THEN ?? END)`;
+// 不满足条件时返回 NULL（没有 ELSE 子句）
+```
+
+**生成的 SQL：**
+```sql
+SELECT
+    id,
+    CASE WHEN `products`.`status` = 'published' 
+         THEN `products`.`name` 
+    END AS `name`,
+    CASE WHEN `products`.`status` = 'published'
+         THEN `products`.`price`
+    END AS `price`
+FROM `products`
+```
+
+**查询结果对比：**
+
+| id | status | name (实际值) | name (查询结果) |
+|----|--------|---------------|-----------------|
+| 1 | published | "Product A" | "Product A" |
+| 2 | draft | "Product B" | NULL |
+| 3 | archived | "Product C" | NULL |
+
+#### 在关联查询中的表现
+
+**M2O 关联的字段置空：**
+
+```sql
+-- 主表权限 + 关联表权限的组合检查
+SELECT
+    `products`.`id`,
+    CASE WHEN `products`.`status` = 'published'
+         THEN `category`.`name`
+    END AS `category__name`
+FROM `products`
+LEFT JOIN `categories` AS `category`
+    ON `products`.`category_id` = `category`.`id`
+```
+
+**O2M 关联的特殊处理：**
+
+O2M 关联通过 `whenCase` 标志位控制：
+
+```typescript
+// run-ast.ts:126-145
+const hasWhenCase = nestedNode.whenCase && nestedNode.whenCase.length > 0;
+let fieldAllowed: boolean | boolean[] = true;
+
+if (hasWhenCase) {
+    if (Array.isArray(items)) {
+        fieldAllowed = [];
+        for (const item of items) {
+            // 从查询结果中提取标志位
+            fieldAllowed.push(!!item[nestedNode.fieldKey]);
+            delete item[nestedNode.fieldKey];
+        }
+    }
+}
+
+// 后续 mergeWithParentItems 时使用 fieldAllowed
+```
+
+**生成的 SQL 中包含标志位：**
+```sql
+SELECT
+    `articles`.`id`,
+    `articles`.`title`,
+    -- 权限标志位
+    CASE WHEN `articles`.`status` = 'published' THEN 1 END AS `comments`
+FROM `articles`
+```
+
+**结果表现：**
+```json
+{
+    "data": [
+        {
+            "id": 1,
+            "title": "Published Article",
+            "comments": [
+                { "id": 1, "content": "Comment 1" },
+                { "id": 2, "content": "Comment 2" }
+            ]
+        },
+        {
+            "id": 2,
+            "title": "Draft Article",
+            "comments": null  // 权限标志位为 false
+        }
+    ]
+}
+```
+
+### 12.3 结果被过滤的场景
+
+这类处理通过在 `WHERE` 子句中添加权限条件实现。
+
+#### 触发条件
+
+- 查询有 `filter` 参数，或者有权限规则
+- 权限规则的 `permissions` 不为空
+
+**核心机制：** `joinFilterWithCases` 将用户过滤条件与权限条件合并
+
+```typescript
+// join-filter-with-cases.ts:3-12
+export function joinFilterWithCases(filter, cases) {
+    if (cases.length > 0 && !filter) {
+        return { _or: cases };  // 只有权限条件
+    } else if (filter && cases.length === 0) {
+        return filter;  // 只有用户过滤条件
+    } else if (filter && cases.length > 0) {
+        return { _and: [filter, { _or: cases }] };  // 两者都有，AND 合并
+    }
+    return null;
+}
+```
+
+**权限规则的语义：**
+
+```typescript
+// permissions = {} 或 null → 完全权限，无行级限制
+// permissions = { status: { _eq: 'published' } } → 行级限制
+```
+
+**SQL 生成：**
+```sql
+-- 用户过滤 + 权限条件
+WHERE (
+    `products`.`category` = 'electronics'  -- 用户过滤
+    AND (
+        `products`.`status` = 'published'  -- 权限条件（OR 组合）
+        OR `products`.`created_by` = 123
+    )
+)
+```
+
+#### 深层过滤中的结果过滤
+
+**关联字段过滤（M2O）：**
+
+```javascript
+{
+    "filter": {
+        "category": {
+            "name": { "_eq": "Electronics" }
+        }
+    }
+}
+```
+
+**权限传播：**
+1. 主查询应用权限条件
+2. JOIN 关联表时，关联表的权限条件也会被检查
+3. 用户过滤条件与权限条件通过 AND 合并
+
+**_some/_none 量词的结果过滤：**
+
+```javascript
+{
+    "filter": {
+        "comments": {
+            "_some": {
+                "status": { "_eq": "approved" }
+            }
+        }
+    }
+}
+```
+
+**SQL 生成（包含权限）：**
+```sql
+WHERE `articles`.`id` IN (
+    SELECT `comments`.`article_id`
+    FROM `comments`
+    WHERE `comments`.`status` = 'approved'
+      -- 自动注入的权限条件
+      AND `comments`.`is_deleted` = 0
+)
+```
+
+### 12.4 三种场景的决策流程图
+
+```
+用户查询请求
+    │
+    ▼
+┌─────────────────────────────────┐
+│  processAst() 阶段              │
+│  (SQL 执行前)                   │
+├─────────────────────────────────┤
+│  检查访问路径权限                │
+│                                 │
+│  ┌─ 集合无权限? ── YES ─────────┼─→ ForbiddenError (403)
+│  │                              │
+│  ├─ 字段不在 fields 中? ── YES ─┼─→ ForbiddenError (403)
+│  │                              │
+│  └─ 字段/集合不存在? ── YES ────┼─→ ForbiddenError (403)
+│                                 │
+└─────────────────────────────────┘
+    │
+    ▼ 权限验证通过，开始生成 SQL
+┌─────────────────────────────────┐
+│  SQL 执行阶段                   │
+│  (数据库层面)                   │
+├─────────────────────────────────┤
+│                                 │
+│  WHERE 条件过滤                 │
+│  ┌───────────────────────────┐  │
+│  │ 用户过滤 AND 权限条件      │  │
+│  │ 不满足条件的行 ──→ 不返回  │  │
+│  └───────────────────────────┘  │
+│                                 │
+│  SELECT 字段处理                │
+│  ┌───────────────────────────┐  │
+│  │ CASE WHEN 权限条件        │  │
+│  │ THEN 列值 ELSE NULL       │  │
+│  │ 不满足条件的字段 ──→ NULL │  │
+│  └───────────────────────────┘  │
+│                                 │
+│  O2M 关联处理                   │
+│  ┌───────────────────────────┐  │
+│  │ 权限标志位决定是否查询关联 │  │
+│  │ 标志位为 0 ──→ 关联为 null│  │
+│  └───────────────────────────┘  │
+│                                 │
+└─────────────────────────────────┘
+```
+
+## 13. 完整追踪示例：同时包含 M2O 与 O2M 的查询
+
+### 13.1 场景设定
+
+**数据模型：**
+```
+articles
+├── id (PK)
+├── title
+├── content
+├── status
+├── author_id (FK → users.id)  ← M2O
+└── created_at
+
+users
+├── id (PK)
+├── name
+├── email
+└── role
+
+comments  ← O2M from articles
+├── id (PK)
+├── article_id (FK → articles.id)
+├── content
+└── is_approved
+```
+
+**用户权限配置：**
+
+```javascript
+// 权限 1: articles - 只能看已发布的文章
+{
+    "collection": "articles",
+    "action": "read",
+    "fields": ["id", "title", "status", "author"],  // 没有 content 字段
+    "permissions": { "status": { "_eq": "published" } }
+}
+
+// 权限 2: users - 只能看作者信息（不是管理员）
+{
+    "collection": "users",
+    "action": "read",
+    "fields": ["id", "name"],  // 没有 email 字段
+    "permissions": { "role": { "_neq": "admin" } }
+}
+
+// 权限 3: comments - 只能看已批准的评论
+{
+    "collection": "comments",
+    "action": "read",
+    "fields": ["*"],
+    "permissions": { "is_approved": { "_eq": true } }
+}
+```
+
+**用户查询：**
+
+```javascript
+GET /items/articles
+{
+    "fields": [
+        "id",
+        "title",
+        "author.id",
+        "author.name",
+        "comments.id",
+        "comments.content"
+    ],
+    "filter": {
+        "created_at": { "_gte": "2024-01-01" }
+    },
+    "deep": {
+        "comments": {
+            "_limit": 5,
+            "_sort": ["-id"]
+        }
+    }
+}
+```
+
+### 13.2 阶段一：查询解析为初始 AST
+
+**调用：** `getAstFromQuery()`
+
+**初始 AST 结构（无权限信息）：**
+
+```
+AST {
+    type: 'root',
+    name: 'articles',
+    query: {
+        filter: { created_at: { _gte: '2024-01-01' } }
+    },
+    children: [
+        { type: 'field', name: 'id', fieldKey: 'id' },
+        { type: 'field', name: 'title', fieldKey: 'title' },
+        {
+            type: 'm2o',
+            name: 'author',
+            fieldKey: 'author',
+            relation: {
+                field: 'author_id',
+                related_collection: 'users'
+            },
+            children: [
+                { type: 'field', name: 'id', fieldKey: 'id' },
+                { type: 'field', name: 'name', fieldKey: 'name' }
+            ],
+            query: {}
+        },
+        {
+            type: 'o2m',
+            name: 'comments',
+            fieldKey: 'comments',
+            relation: {
+                field: 'article_id',
+                collection: 'comments'
+            },
+            children: [
+                { type: 'field', name: 'id', fieldKey: 'id' },
+                { type: 'field', name: 'content', fieldKey: 'content' }
+            ],
+            query: {
+                limit: 5,
+                sort: ['-id']
+            }
+        }
+    ],
+    cases: [],  // 空
+    whenCase: undefined
+}
+```
+
+**FieldMap 提取：**
+
+```javascript
+fieldMap = {
+    read: Map{
+        '': { collection: 'articles', fields: {'id', 'title', 'author', 'comments'} },
+        'author': { collection: 'users', fields: {'id', 'name'} },
+        'comments': { collection: 'comments', fields: {'id', 'content'} }
+    },
+    other: Map{}
+}
+```
+
+### 13.3 阶段二：权限验证与注入
+
+**调用：** `processAst()`
+
+#### 步骤 1：权限获取
+
+```javascript
+// fetchPermissions 返回用户的三个权限规则
+permissions = [
+    { collection: 'articles', permissions: { status: { _eq: 'published' } }, fields: ['id','title','status','author'] },
+    { collection: 'users', permissions: { role: { _neq: 'admin' } }, fields: ['id','name'] },
+    { collection: 'comments', permissions: { is_approved: { _eq: true } }, fields: ['*'] }
+]
+```
+
+#### 步骤 2：路径权限验证
+
+**路径 '' (articles)：**
+- 权限存在 ✓
+- 请求字段：`id`, `title`, `author`, `comments`
+- 权限字段：`id`, `title`, `status`, `author`
+- `comments` 不在权限字段中？
+- 不，`comments` 是关联字段，在 `fields` 中包含 `author` 表示可以访问关联
+
+**路径 'author' (users)：**
+- 权限存在 ✓
+- 请求字段：`id`, `name`
+- 权限字段：`id`, `name`
+- 完全匹配 ✓
+
+**路径 'comments' (comments)：**
+- 权限存在 ✓
+- 请求字段：`id`, `content`
+- 权限字段：`*`
+- 完全权限 ✓
+
+#### 步骤 3：injectCases 递归注入
+
+**第一层：articles（根节点）**
+
+```typescript
+// getCases('articles', permissions, ['id', 'title', 'author', 'comments'])
+cases = [
+    { status: { _eq: 'published' } }
+]
+caseMap = {
+    'id': [0],
+    'title': [0],
+    'status': [0],
+    'author': [0]
+}
+allowedFields = new Set()  // permissions 不是空对象
+```
+
+**设置根节点 cases：**
+```
+ast.cases = [{ status: { _eq: 'published' } }]
+```
+
+**处理子节点：**
+
+| 子节点 | whenCase | 说明 |
+|-------|----------|------|
+| field: id | [0] | 需要满足规则 0 |
+| field: title | [0] | 需要满足规则 0 |
+| m2o: author | [0] | 需要满足规则 0，递归处理 |
+| o2m: comments | [0] | 需要满足规则 0，递归处理 |
+
+**第二层：M2O 关联 - author (users)**
+
+```typescript
+// getCases('users', permissions, ['id', 'name'])
+cases = [
+    { role: { _neq: 'admin' } }
+]
+caseMap = {
+    'id': [0],
+    'name': [0]
+}
+allowedFields = new Set()
+```
+
+**设置 M2O 节点：**
+```
+m2oNode = {
+    type: 'm2o',
+    name: 'author',
+    whenCase: [0],  // 父级权限索引
+    cases: [{ role: { _neq: 'admin' } }],  // 自身权限规则
+    children: [
+        { type: 'field', name: 'id', whenCase: [0] },
+        { type: 'field', name: 'name', whenCase: [0] }
+    ]
+}
+```
+
+**第三层：O2M 关联 - comments (comments)**
+
+```typescript
+// getCases('comments', permissions, ['id', 'content'])
+cases = [
+    { is_approved: { _eq: true } }
+]
+caseMap = {
+    '*': [0]  // fields: ['*']
+}
+allowedFields = new Set()  // permissions 不是空对象
+```
+
+**设置 O2M 节点：**
+```
+o2mNode = {
+    type: 'o2m',
+    name: 'comments',
+    whenCase: [0],  // 父级权限索引
+    cases: [{ is_approved: { _eq: true } }],  // 自身权限规则
+    children: [
+        { type: 'field', name: 'id', whenCase: [0] },
+        { type: 'field', name: 'content', whenCase: [0] }
+    ]
+}
+```
+
+#### 最终注入权限后的 AST
+
+```
+AST {
+    type: 'root',
+    name: 'articles',
+    query: { filter: { created_at: { _gte: '2024-01-01' } } },
+    cases: [
+        { status: { _eq: 'published' } }  // 根节点权限规则
+    ],
+    children: [
+        {
+            type: 'field',
+            name: 'id',
+            fieldKey: 'id',
+            whenCase: [0]  // 需满足 cases[0]
+        },
+        {
+            type: 'field',
+            name: 'title',
+            fieldKey: 'title',
+            whenCase: [0]
+        },
+        {
+            type: 'm2o',
+            name: 'author',
+            fieldKey: 'author',
+            relation: { field: 'author_id', related_collection: 'users' },
+            whenCase: [0],  // 父级权限
+            cases: [
+                { role: { _neq: 'admin' } }  // M2O 自身权限
+            ],
+            children: [
+                { type: 'field', name: 'id', whenCase: [0] },
+                { type: 'field', name: 'name', whenCase: [0] }
+            ]
+        },
+        {
+            type: 'o2m',
+            name: 'comments',
+            fieldKey: 'comments',
+            relation: { field: 'article_id', collection: 'comments' },
+            whenCase: [0],  // 父级权限
+            cases: [
+                { is_approved: { _eq: true } }  // O2M 自身权限
+            ],
+            children: [
+                { type: 'field', name: 'id', whenCase: [0] },
+                { type: 'field', name: 'content', whenCase: [0] }
+            ],
+            query: { limit: 5, sort: ['-id'] }
+        }
+    ]
+}
+```
+
+### 13.4 阶段三：SQL 生成
+
+#### 主查询 SQL（articles）
+
+**调用：** `getDBQuery()` + `runAst()`
+
+**过滤条件合并：**
+```typescript
+// joinFilterWithCases(
+//     { created_at: { _gte: '2024-01-01' } },  // 用户过滤
+//     [{ status: { _eq: 'published' } }]         // 权限条件
+// )
+
+result = {
+    _and: [
+        { created_at: { _gte: '2024-01-01' } },
+        { _or: [{ status: { _eq: 'published' } }] }
+    ]
+}
+```
+
+**生成的主查询 SQL：**
+
+```sql
+SELECT
+    `articles`.`id`,
+    -- CASE WHEN 包裹有权限限制的字段
+    CASE WHEN `articles`.`status` = 'published'
+         THEN `articles`.`title`
+    END AS `title`,
+    -- 权限标志位（用于 O2M 关联）
+    CASE WHEN `articles`.`status` = 'published' THEN 1 END AS `comments`,
+    -- M2O 外键（用于 JOIN）
+    `articles`.`author_id`
+FROM `articles`
+WHERE
+    -- 用户过滤 + 权限条件
+    `articles`.`created_at` >= '2024-01-01'
+    AND `articles`.`status` = 'published'
+```
+
+**M2O 关联的 JOIN 处理：**
+
+M2O 字段通过单独的 SELECT 和后续合并处理：
+
+```sql
+-- 第二次查询：获取 author 关联
+SELECT
+    `users`.`id`,
+    CASE WHEN `users`.`role` != 'admin'
+         THEN `users`.`name`
+    END AS `name`
+FROM `users`
+WHERE
+    `users`.`id` IN (?, ?, ?)  -- 从主查询结果提取的 author_id
+    AND `users`.`role` != 'admin'  -- 权限条件
+```
+
+**O2M 关联的独立查询：**
+
+```typescript
+// runAst.ts:121-167
+// O2M 关联通过递归 runAst 处理
+nestedItems = await runAst(o2mNode, schema, accountability, { knex, nested: true });
+```
+
+**生成的 O2M 查询 SQL：**
+
+```sql
+SELECT
+    `comments`.`id`,
+    CASE WHEN `comments`.`is_approved` = 1
+         THEN `comments`.`content`
+    END AS `content`,
+    `comments`.`article_id`  -- 用于关联
+FROM `comments`
+WHERE
+    `comments`.`article_id` IN (?, ?, ?)  -- 父级主键
+    AND `comments`.`is_approved` = 1  -- 权限条件
+ORDER BY `comments`.`id` DESC
+LIMIT 5
+```
+
+### 13.5 阶段四：结果合并
+
+**假设数据库中的数据：**
+
+```
+articles:
+┌────┬───────────┬────────────┬─────────────────────────┐
+│ id │ status    │ title      │ author_id               │
+├────┼───────────┼────────────┼─────────────────────────┤
+│ 1  │ published │ Article A  │ 101 (role: 'editor')    │
+│ 2  │ draft     │ Article B  │ 102 (role: 'admin')     │
+│ 3  │ published │ Article C  │ 102 (role: 'admin')     │
+└────┴───────────┴────────────┴─────────────────────────┘
+
+comments:
+┌────┬────────────┬─────────────┬─────────────┐
+│ id │ article_id │ content     │ is_approved │
+├────┼────────────┼─────────────┼─────────────┤
+│ 1  │ 1          │ Comment 1   │ true        │
+│ 2  │ 1          │ Comment 2   │ false       │
+│ 3  │ 2          │ Comment 3   │ true        │
+│ 4  │ 3          │ Comment 4   │ true        │
+└────┴────────────┴─────────────┴─────────────┘
+```
+
+#### 主查询结果（WHERE 过滤后）：
+
+```
+WHERE created_at >= '2024-01-01' AND status = 'published'
+
+结果只包含 id=1 和 id=3（id=2 的 status='draft' 被过滤）
+```
+
+#### id=1 (published, author=101 role='editor'):
+
+**主查询行：**
+```javascript
+{
+    id: 1,
+    title: 'Article A',  // CASE WHEN 条件满足
+    comments: 1,         // 权限标志位 = true
+    author_id: 101
+}
+```
+
+**M2O 关联查询（users）：**
+```
+WHERE id = 101 AND role != 'admin'
+→ 匹配，返回: { id: 101, name: 'User 101' }
+```
+
+**O2M 关联查询（comments）：**
+```
+WHERE article_id = 1 AND is_approved = true
+→ 只返回 id=1 的评论（id=2 is_approved=false 被过滤）
+→ { id: 1, content: 'Comment 1' }
+```
+
+#### id=3 (published, author=102 role='admin'):
+
+**主查询行：**
+```javascript
+{
+    id: 3,
+    title: 'Article C',  // CASE WHEN 条件满足
+    comments: 1,         // 权限标志位 = true
+    author_id: 102
+}
+```
+
+**M2O 关联查询（users）：**
+```
+WHERE id = 102 AND role != 'admin'
+→ 不匹配（role='admin'），返回空
+→ author: null 或 { id: null, name: null }
+```
+
+**O2M 关联查询（comments）：**
+```
+WHERE article_id = 3 AND is_approved = true
+→ 返回 { id: 4, content: 'Comment 4' }
+```
+
+### 13.6 最终返回结果
+
+```json
+{
+    "data": [
+        {
+            "id": 1,
+            "title": "Article A",
+            "author": {
+                "id": 101,
+                "name": "User 101"
+            },
+            "comments": [
+                {
+                    "id": 1,
+                    "content": "Comment 1"
+                }
+            ]
+        },
+        {
+            "id": 3,
+            "title": "Article C",
+            "author": null,  // author.role='admin'，不满足权限
+            "comments": [
+                {
+                    "id": 4,
+                    "content": "Comment 4"
+                }
+            ]
+        }
+    ]
+}
+```
+
+### 13.7 权限传播路径总结
+
+```
+用户请求
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ 1. 初始 AST（无权限）                                │
+├─────────────────────────────────────────────────────┤
+│ articles                                            │
+│ ├── id                                              │
+│ ├── title                                           │
+│ ├── author (M2O → users)                            │
+│ │   ├── id                                          │
+│ │   └── name                                        │
+│ └── comments (O2M → comments)                       │
+│     ├── id                                          │
+│     └── content                                     │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ 2. 注入权限后的 AST                                  │
+├─────────────────────────────────────────────────────┤
+│ articles                                            │
+│ ├── cases: [{ status: 'published' }]                │
+│ ├── id          (whenCase: [0])                     │
+│ ├── title       (whenCase: [0])                     │
+│ ├── author (M2O)                                    │
+│ │   ├── whenCase: [0]        ← 父级权限             │
+│ │   ├── cases: [{ role: '!= admin' }] ← 自身权限   │
+│ │   ├── id      (whenCase: [0])                     │
+│ │   └── name    (whenCase: [0])                     │
+│ └── comments (O2M)                                  │
+│     ├── whenCase: [0]        ← 父级权限             │
+│     ├── cases: [{ is_approved: true }] ← 自身权限   │
+│     ├── id      (whenCase: [0])                     │
+│     └── content (whenCase: [0])                     │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ 3. SQL 生成                                          │
+├─────────────────────────────────────────────────────┤
+│ 主查询 articles:                                     │
+│ ├── WHERE: created_at >= ? AND status = 'published' │
+│ ├── SELECT: id, CASE title, CASE comments_flag      │
+│ └── JOIN: 通过后续查询处理 M2O                       │
+│                                                     │
+│ 子查询 users (M2O):                                  │
+│ ├── WHERE: id IN (?) AND role != 'admin'            │
+│ └── SELECT: id, CASE name                           │
+│                                                     │
+│ 子查询 comments (O2M):                               │
+│ ├── WHERE: article_id IN (?) AND is_approved = true │
+│ ├── ORDER BY: id DESC                               │
+│ └── LIMIT: 5                                        │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ 4. 结果过滤                                          │
+├─────────────────────────────────────────────────────┤
+│ id=1: ✓ (published)                                 │
+│ ├── title: 'Article A'     (条件满足)               │
+│ ├── author: {id:101, name:'...'} (role!='admin')    │
+│ └── comments: [Comment 1]   (is_approved=true)      │
+│                                                     │
+│ id=2: ✗ (draft → WHERE 过滤)                        │
+│                                                     │
+│ id=3: ✓ (published)                                 │
+│ ├── title: 'Article C'     (条件满足)               │
+│ ├── author: null            (role='admin' → 过滤)   │
+│ └── comments: [Comment 4]   (is_approved=true)      │
+└─────────────────────────────────────────────────────┘
+```
+
+## 14. 总结
 
 Directus 的权限传播机制具有以下特点：
 
@@ -850,7 +1890,12 @@ Directus 的权限传播机制具有以下特点：
    - `deepMapFilter` 支持遍历任意深度的关联过滤
    - 所有 JOIN 和子查询都会经过权限检查
 
-5. **性能优化**：
+5. **三级权限处理策略**：
+   - **403 Forbidden**：集合/字段完全无权限（SQL 执行前）
+   - **字段置空 NULL**：行级权限条件不满足（SQL CASE/WHEN）
+   - **结果过滤**：WHERE 条件排除不满足权限的行
+
+6. **性能优化**：
    - 跳过无关规则
    - 完全权限字段省略 CASE/WHEN
    - 空规则短路逻辑运算
