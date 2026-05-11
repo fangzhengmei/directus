@@ -1351,20 +1351,189 @@ GET /items/articles
 
 #### 问题分析：为什么会报错
 
-**步骤 1：FieldMap 提取（extract-fields-from-children.ts:19）**
+**关键背景：FieldMap 的 read vs other 分区**
+
+根据源码 `field-map-from-ast.ts:7-13`，FieldMap 提取分为两步：
 
 ```typescript
-// 遍历 AST children，为每个节点添加 fieldKey
-for (const child of children) {
-    info.fields.add(getUnaliasedFieldKey(child));
-    // ...
+export function fieldMapFromAst(ast: AST, schema: SchemaOverview): FieldMap {
+    const fieldMap: FieldMap = { read: new Map(), other: new Map() };
+
+    extractFieldsFromChildren(ast.name, ast.children, fieldMap, schema);  // 第一步
+    extractFieldsFromQuery(ast.name, ast.query, fieldMap, schema);         // 第二步
+
+    return fieldMap;
 }
 ```
 
-**提取结果：**
+**步骤 1：extractFieldsFromChildren 写入 `other` map**
+
+`extract-fields-from-children.ts:16` 明确写入 `other` map：
+
+```typescript
+const info = getInfoForPath(fieldMap, 'other', path, collection);
+//                                           ^^^^^ 写入 other map
+
+for (const child of children) {
+    info.fields.add(getUnaliasedFieldKey(child));
+    // 递归处理关联节点...
+}
+```
+
+**步骤 2：extractFieldsFromQuery 写入 `read` 或 `other` map**
+
+`extract-fields-from-query.ts:17-22` 根据路径类型区分：
+
+```typescript
+const { paths: otherPaths, readOnlyPaths } = extractPathsFromQuery(query);
+
+const groupedPaths = {
+    other: otherPaths,      // aggregate、group → other map
+    read: readOnlyPaths,    // filter、sort → read map
+};
+```
+
+根据 `extract-paths-from-query.ts:26-84`：
+- **`readOnlyPaths`**：来自 `filter`、`sort` 条件中的字段
+- **`otherPaths`**：来自 `aggregate`、`group` 条件中的字段
+
+---
+
+**现在回到示例，逐步追踪 FieldMap 提取：**
+
+**查询内容：**
+```javascript
+{
+    "fields": ["id", "title", "author.id", "author.name", "comments.id", "comments.content"],
+    "filter": {
+        "created_at": { "_gte": "2024-01-01" }
+    },
+    "deep": {
+        "comments": {
+            "_limit": 5,
+            "_sort": ["-id"]
+        }
+    }
+}
+```
+
+**初始 AST：**
+```
+AST {
+    name: 'articles',
+    query: { filter: { created_at: { _gte: '2024-01-01' } } },
+    children: [
+        { type: 'field', fieldKey: 'id' },
+        { type: 'field', fieldKey: 'title' },
+        {
+            type: 'm2o', fieldKey: 'author',
+            relation: { related_collection: 'users' },
+            children: [
+                { type: 'field', fieldKey: 'id' },
+                { type: 'field', fieldKey: 'name' }
+            ],
+            query: {}
+        },
+        {
+            type: 'o2m', fieldKey: 'comments',
+            relation: { collection: 'comments' },
+            children: [
+                { type: 'field', fieldKey: 'id' },
+                { type: 'field', fieldKey: 'content' }
+            ],
+            query: { limit: 5, sort: ['-id'] }
+        }
+    ]
+}
+```
+
+---
+
+**FieldMap 提取逐步追踪：**
+
+**第一步：extractFieldsFromChildren（写入 `other` map）**
+
+调用：`extractFieldsFromChildren('articles', ast.children, fieldMap, schema, [])`
+
+1. **处理根路径 `''`（articles）**
+   ```
+   getInfoForPath(fieldMap, 'other', [], 'articles')
+   → fieldMap.other.set('', { collection: 'articles', fields: Set{} })
+   
+   遍历 children，添加 fieldKey：
+   - child 'id' → fields.add('id')
+   - child 'title' → fields.add('title')
+   - child 'author' → fields.add('author')
+   - child 'comments' → fields.add('comments')  // ⚠️ 这里！
+   ```
+
+2. **递归处理 M2O 关联 `author`（path = ['author']）**
+   ```
+   调用：extractFieldsFromChildren('users', author.children, fieldMap, schema, ['author'])
+   
+   getInfoForPath(fieldMap, 'other', ['author'], 'users')
+   → fieldMap.other.set('author', { collection: 'users', fields: Set{} })
+   
+   遍历 children，添加 fieldKey：
+   - child 'id' → fields.add('id')
+   - child 'name' → fields.add('name')
+   
+   调用 extractFieldsFromQuery('users', {}, ...) → query 为空，无操作
+   ```
+
+3. **递归处理 O2M 关联 `comments`（path = ['comments']）**
+   ```
+   调用：extractFieldsFromChildren('comments', comments.children, fieldMap, schema, ['comments'])
+   
+   getInfoForPath(fieldMap, 'other', ['comments'], 'comments')
+   → fieldMap.other.set('comments', { collection: 'comments', fields: Set{} })
+   
+   遍历 children，添加 fieldKey：
+   - child 'id' → fields.add('id')
+   - child 'content' → fields.add('content')
+   
+   调用 extractFieldsFromQuery('comments', { limit: 5, sort: ['-id'] }, ...)
+   ```
+
+**第二步：extractFieldsFromQuery（写入 `read` 或 `other` map）**
+
+调用：`extractFieldsFromQuery('articles', { filter: { created_at: ... } }, fieldMap, schema, [])`
+
+1. **根查询的 filter → `read` map**
+   ```
+   extractPathsFromQuery({ filter: { created_at: ... } })
+   → readOnlyPaths = [['created_at']]
+   → otherPaths = []
+   
+   处理路径 ['created_at']：
+   getInfoForPath(fieldMap, 'read', [], 'articles')
+   → fieldMap.read.set('', { collection: 'articles', fields: Set{} })
+   info.fields.add('created_at')
+   ```
+
+2. **O2M 关联的 sort → `read` map**
+   在第一步的 O2M 递归中已调用：
+   ```
+   extractFieldsFromQuery('comments', { limit: 5, sort: ['-id'] }, ..., ['comments'])
+   
+   extractPathsFromQuery({ limit: 5, sort: ['-id'] })
+   → readOnlyPaths = [['id']]
+   → otherPaths = []
+   
+   处理路径 ['id']：
+   getInfoForPath(fieldMap, 'read', ['comments'], 'comments')
+   → fieldMap.read.set('comments', { collection: 'comments', fields: Set{} })
+   info.fields.add('id')
+   ```
+
+---
+
+**最终 FieldMap 结构：**
+
 ```javascript
 fieldMap = {
-    read: Map{
+    // other map：来自 extractFieldsFromChildren（AST children 的字段）
+    other: Map{
         '': {
             collection: 'articles',
             fields: Set{'id', 'title', 'author', 'comments'}  // ⚠️ 包含 comments
@@ -1378,34 +1547,78 @@ fieldMap = {
             fields: Set{'id', 'content'}
         }
     },
-    other: Map{}
+    // read map：来自 extractFieldsFromQuery（filter/sort 中的字段）
+    read: Map{
+        '': {
+            collection: 'articles',
+            fields: Set{'created_at'}
+        },
+        'comments': {
+            collection: 'comments',
+            fields: Set{'id'}
+        }
+    }
 }
 ```
 
-**关键发现：**
-- 查询请求了 `comments.id` 和 `comments.content`
-- 这导致 `extractFieldsFromChildren` 在根路径 `''` (articles) 下添加了 `'comments'` 字段
-- 因为 `comments` 是 O2M 关联节点的 `fieldKey`
+---
 
-**步骤 2：validatePathPermissions 校验（validate-path-permissions.ts:36-41）**
+**校验顺序：先校验 `other`，再校验 `read`**
+
+根据 `process-ast.ts:54-62`：
 
 ```typescript
-// 权限 1 的 fields
-const permissionsFields = ["id", "title", "status", "author"];
+// 第一步：校验 fieldMap.other（使用 permissions）
+for (const [path, { collection, fields }] of fieldMap.other.entries()) {
+    validatePathPermissions(path, permissions, collection, fields);
+}
+
+// 第二步：校验 fieldMap.read（使用 readPermissions）
+for (const [path, { collection, fields }] of fieldMap.read.entries()) {
+    validatePathPermissions(path, readPermissions, collection, fields);
+}
+```
+
+**对于 action === 'read' 的特殊情况**（process-ast.ts:41-47）：
+```typescript
+const readPermissions =
+    options.action === 'read'
+        ? permissions  // 同一个权限集合
+        : await fetchPermissions({ action: 'read', ... }, context);
+```
+
+---
+
+**报错触发详细过程：**
+
+**第一步：校验 `fieldMap.other`**
+
+原权限配置：
+```javascript
+{
+    "collection": "articles",
+    "fields": ["id", "title", "status", "author"],  // ⚠️ 缺少 comments
+    "permissions": { "status": { "_eq": "published" } }
+}
+```
+
+校验路径 `''` (articles)：
+```typescript
+// fieldMap.other.get('')
+const requestedFields = ['id', 'title', 'author', 'comments'];
 
 // 构建 allowedFields
-const allowedFields = new Set(["id", "title", "status", "author"]);
+const allowedFields = new Set(['id', 'title', 'status', 'author']);
 
-// 检查请求字段
-const requestedFields = ["id", "title", "author", "comments"];
+// 检查
 const forbiddenFields = requestedFields.filter(
     field => allowedFields.has(field) === false
 );
 
-// forbiddenFields = ["comments"]
+// forbiddenFields = ['comments']
 
 if (forbiddenFields.length > 0) {
-    throw createFieldsForbiddenError(path, collection, forbiddenFields);
+    throw createFieldsForbiddenError('', 'articles', ['comments']);
 }
 ```
 
@@ -1414,6 +1627,11 @@ if (forbiddenFields.length > 0) {
 HTTP 403 Forbidden
 "You don't have permission to access the following fields in 'articles': comments"
 ```
+
+**注意：**
+- 报错发生在校验 `fieldMap.other` 的第一步
+- `fieldMap.read` 还没开始校验
+- 对于 `action === 'read'`，即使校验 `read` map 也会用相同的权限集合，结果相同
 
 **根本原因：**
 - 即使 `comments` 是关联字段（O2M），它仍然作为父集合的字段被检查
