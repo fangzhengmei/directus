@@ -342,11 +342,12 @@ await db('directus_users').insert({ ...defaultAdminUser, id: randomUUID(), ... }
 
 | 特性 | `directus init` | `directus bootstrap` |
 |------|-----------------|----------------------|
-| 适用场景 | 全新项目首次初始化 | 容器化/自动化部署 |
-| 交互性 | 交互式 | 非交互式 |
-| 依赖 .env | 生成新的 | 需要预先配置好 |
-| 数据库驱动 | 自动安装 | 需预先安装 |
-| 管理员创建 | 交互式创建 | 可选跳过 |
+| 适用场景 | 开发者本地交互式初始化 | 容器化/自动化部署、版本升级迁移 |
+| 交互性 | 交互式（inquirer） | 非交互式 |
+| 配置依赖 | ❌ 不依赖 `useEnv()`，直接使用用户输入的凭据 | ✅ 依赖 `useEnv()` 配置加载机制 |
+| 默认配置来源 | 无，完全交互式 | `.env` 文件（可通过 `CONFIG_PATH` 指定其他格式） |
+| 数据库驱动 | 自动 `npm install` | 需预先安装 |
+| 管理员创建 | 必须交互式创建 | 可选（需配置 `ADMIN_EMAIL` / `ADMIN_PASSWORD`） |
 
 ### 6.2 流程
 
@@ -374,13 +375,14 @@ bootstrap() [api/src/cli/commands/bootstrap/index.ts:16-66]
 
 ### 6.4 环境变量驱动的配置
 
-`bootstrap` 支持通过环境变量自动化配置：
+`bootstrap` 通过 `useEnv()` 读取所有配置，支持以下环境变量（不限于这些）：
 
-| 环境变量 | 作用 |
-|----------|------|
-| `PROJECT_NAME` | 设置项目名称（写入 `directus_settings`） |
-| `PROJECT_OWNER` | 设置项目所有者邮箱 |
-| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | 自动创建管理员账户（在 `createAdmin()` 中使用） |
+| 环境变量 | 作用 | 必需性 |
+|----------|------|--------|
+| `DB_CLIENT`, `DB_HOST`, `DB_PORT` 等 | 数据库连接配置 | ✅ 必需 |
+| `PROJECT_NAME` | 设置项目名称（写入 `directus_settings`） | ❌ 可选 |
+| `PROJECT_OWNER` | 设置项目所有者邮箱 | ❌ 可选 |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | 首次启动时自动创建管理员账户 | ❌ 可选（未配置则不创建） |
 
 ---
 
