@@ -1270,7 +1270,9 @@ WHERE `articles`.`id` IN (
 
 ## 13. 完整追踪示例：同时包含 M2O 与 O2M 的查询
 
-### 13.1 场景设定
+### 13.1 原示例的问题：validatePathPermissions 阶段报错
+
+#### 数据模型和查询保持不变
 
 **数据模型：**
 ```
@@ -1295,36 +1297,7 @@ comments  ← O2M from articles
 └── is_approved
 ```
 
-**用户权限配置：**
-
-```javascript
-// 权限 1: articles - 只能看已发布的文章
-{
-    "collection": "articles",
-    "action": "read",
-    "fields": ["id", "title", "status", "author"],  // 没有 content 字段
-    "permissions": { "status": { "_eq": "published" } }
-}
-
-// 权限 2: users - 只能看作者信息（不是管理员）
-{
-    "collection": "users",
-    "action": "read",
-    "fields": ["id", "name"],  // 没有 email 字段
-    "permissions": { "role": { "_neq": "admin" } }
-}
-
-// 权限 3: comments - 只能看已批准的评论
-{
-    "collection": "comments",
-    "action": "read",
-    "fields": ["*"],
-    "permissions": { "is_approved": { "_eq": true } }
-}
-```
-
 **用户查询：**
-
 ```javascript
 GET /items/articles
 {
@@ -1348,7 +1321,151 @@ GET /items/articles
 }
 ```
 
-### 13.2 阶段一：查询解析为初始 AST
+#### 原权限配置（有问题的版本）
+
+```javascript
+// 权限 1: articles - 只能看已发布的文章
+{
+    "collection": "articles",
+    "action": "read",
+    "fields": ["id", "title", "status", "author"],  // ⚠️ 缺少 comments 字段
+    "permissions": { "status": { "_eq": "published" } }
+}
+
+// 权限 2: users - 只能看作者信息（不是管理员）
+{
+    "collection": "users",
+    "action": "read",
+    "fields": ["id", "name"],
+    "permissions": { "role": { "_neq": "admin" } }
+}
+
+// 权限 3: comments - 只能看已批准的评论
+{
+    "collection": "comments",
+    "action": "read",
+    "fields": ["*"],
+    "permissions": { "is_approved": { "_eq": true } }
+}
+```
+
+#### 问题分析：为什么会报错
+
+**步骤 1：FieldMap 提取（extract-fields-from-children.ts:19）**
+
+```typescript
+// 遍历 AST children，为每个节点添加 fieldKey
+for (const child of children) {
+    info.fields.add(getUnaliasedFieldKey(child));
+    // ...
+}
+```
+
+**提取结果：**
+```javascript
+fieldMap = {
+    read: Map{
+        '': {
+            collection: 'articles',
+            fields: Set{'id', 'title', 'author', 'comments'}  // ⚠️ 包含 comments
+        },
+        'author': {
+            collection: 'users',
+            fields: Set{'id', 'name'}
+        },
+        'comments': {
+            collection: 'comments',
+            fields: Set{'id', 'content'}
+        }
+    },
+    other: Map{}
+}
+```
+
+**关键发现：**
+- 查询请求了 `comments.id` 和 `comments.content`
+- 这导致 `extractFieldsFromChildren` 在根路径 `''` (articles) 下添加了 `'comments'` 字段
+- 因为 `comments` 是 O2M 关联节点的 `fieldKey`
+
+**步骤 2：validatePathPermissions 校验（validate-path-permissions.ts:36-41）**
+
+```typescript
+// 权限 1 的 fields
+const permissionsFields = ["id", "title", "status", "author"];
+
+// 构建 allowedFields
+const allowedFields = new Set(["id", "title", "status", "author"]);
+
+// 检查请求字段
+const requestedFields = ["id", "title", "author", "comments"];
+const forbiddenFields = requestedFields.filter(
+    field => allowedFields.has(field) === false
+);
+
+// forbiddenFields = ["comments"]
+
+if (forbiddenFields.length > 0) {
+    throw createFieldsForbiddenError(path, collection, forbiddenFields);
+}
+```
+
+**报错触发：**
+```
+HTTP 403 Forbidden
+"You don't have permission to access the following fields in 'articles': comments"
+```
+
+**根本原因：**
+- 即使 `comments` 是关联字段（O2M），它仍然作为父集合的字段被检查
+- Directus 的权限模型中：访问 `articles.comments` 需要同时满足：
+  1. `articles` 集合的 `fields` 包含 `comments`（或为 `*`）
+  2. `comments` 集合有读取权限
+
+### 13.2 修正后的权限配置
+
+**方法：在 articles 的权限中添加 `comments` 字段**
+
+```javascript
+// 权限 1: articles - 只能看已发布的文章
+{
+    "collection": "articles",
+    "action": "read",
+    "fields": ["id", "title", "status", "author", "comments"],  // ✅ 添加了 comments
+    "permissions": { "status": { "_eq": "published" } }
+}
+
+// 权限 2: users - 只能看作者信息（不是管理员）
+{
+    "collection": "users",
+    "action": "read",
+    "fields": ["id", "name"],
+    "permissions": { "role": { "_neq": "admin" } }
+}
+
+// 权限 3: comments - 只能看已批准的评论
+{
+    "collection": "comments",
+    "action": "read",
+    "fields": ["*"],
+    "permissions": { "is_approved": { "_eq": true } }
+}
+```
+
+**或者更简单的方式：使用 `*`**
+```javascript
+{
+    "collection": "articles",
+    "action": "read",
+    "fields": ["*"],  // 所有字段
+    "permissions": { "status": { "_eq": "published" } }
+}
+```
+
+---
+
+### 13.3 完整追踪：修正后的权限配置
+
+#### 阶段一：查询解析为初始 AST
 
 **调用：** `getAstFromQuery()`
 
@@ -1396,7 +1513,7 @@ AST {
             }
         }
     ],
-    cases: [],  // 空
+    cases: [],
     whenCase: undefined
 }
 ```
@@ -1406,37 +1523,47 @@ AST {
 ```javascript
 fieldMap = {
     read: Map{
-        '': { collection: 'articles', fields: {'id', 'title', 'author', 'comments'} },
-        'author': { collection: 'users', fields: {'id', 'name'} },
-        'comments': { collection: 'comments', fields: {'id', 'content'} }
+        '': { collection: 'articles', fields: Set{'id', 'title', 'author', 'comments'} },
+        'author': { collection: 'users', fields: Set{'id', 'name'} },
+        'comments': { collection: 'comments', fields: Set{'id', 'content'} }
     },
     other: Map{}
 }
 ```
 
-### 13.3 阶段二：权限验证与注入
+#### 阶段二：权限验证与注入
 
 **调用：** `processAst()`
 
-#### 步骤 1：权限获取
+##### 步骤 1：权限获取
 
 ```javascript
-// fetchPermissions 返回用户的三个权限规则
 permissions = [
-    { collection: 'articles', permissions: { status: { _eq: 'published' } }, fields: ['id','title','status','author'] },
-    { collection: 'users', permissions: { role: { _neq: 'admin' } }, fields: ['id','name'] },
-    { collection: 'comments', permissions: { is_approved: { _eq: true } }, fields: ['*'] }
+    {
+        collection: 'articles',
+        permissions: { status: { _eq: 'published' } },
+        fields: ['id', 'title', 'status', 'author', 'comments']
+    },
+    {
+        collection: 'users',
+        permissions: { role: { _neq: 'admin' } },
+        fields: ['id', 'name']
+    },
+    {
+        collection: 'comments',
+        permissions: { is_approved: { _eq: true } },
+        fields: ['*']
+    }
 ]
 ```
 
-#### 步骤 2：路径权限验证
+##### 步骤 2：路径权限验证（validatePathPermissions）
 
 **路径 '' (articles)：**
 - 权限存在 ✓
 - 请求字段：`id`, `title`, `author`, `comments`
-- 权限字段：`id`, `title`, `status`, `author`
-- `comments` 不在权限字段中？
-- 不，`comments` 是关联字段，在 `fields` 中包含 `author` 表示可以访问关联
+- 权限字段：`id`, `title`, `status`, `author`, `comments`
+- 完全匹配 ✓（现在包含 comments 了）
 
 **路径 'author' (users)：**
 - 权限存在 ✓
@@ -1450,12 +1577,15 @@ permissions = [
 - 权限字段：`*`
 - 完全权限 ✓
 
-#### 步骤 3：injectCases 递归注入
+**验证通过，继续执行 injectCases**
+
+##### 步骤 3：injectCases 递归注入
 
 **第一层：articles（根节点）**
 
 ```typescript
 // getCases('articles', permissions, ['id', 'title', 'author', 'comments'])
+// 从 articles 的权限规则中提取
 cases = [
     { status: { _eq: 'published' } }
 ]
@@ -1463,7 +1593,8 @@ caseMap = {
     'id': [0],
     'title': [0],
     'status': [0],
-    'author': [0]
+    'author': [0],
+    'comments': [0]  // ✅ 现在包含了
 }
 allowedFields = new Set()  // permissions 不是空对象
 ```
@@ -1537,7 +1668,7 @@ o2mNode = {
 }
 ```
 
-#### 最终注入权限后的 AST
+##### 最终注入权限后的 AST
 
 ```
 AST {
@@ -1593,9 +1724,9 @@ AST {
 }
 ```
 
-### 13.4 阶段三：SQL 生成
+#### 阶段三：SQL 生成
 
-#### 主查询 SQL（articles）
+##### 主查询 SQL（articles）
 
 **调用：** `getDBQuery()` + `runAst()`
 
@@ -1625,7 +1756,7 @@ SELECT
     END AS `title`,
     -- 权限标志位（用于 O2M 关联）
     CASE WHEN `articles`.`status` = 'published' THEN 1 END AS `comments`,
-    -- M2O 外键（用于 JOIN）
+    -- M2O 外键（用于后续查询）
     `articles`.`author_id`
 FROM `articles`
 WHERE
@@ -1634,12 +1765,17 @@ WHERE
     AND `articles`.`status` = 'published'
 ```
 
-**M2O 关联的 JOIN 处理：**
+**关键点：**
+- `title` 字段被 `CASE WHEN` 包裹：不满足权限条件时返回 NULL
+- `comments` 作为权限标志位：决定是否查询 O2M 关联
+- `author_id` 直接选择：用于后续 M2O 关联查询
 
-M2O 字段通过单独的 SELECT 和后续合并处理：
+##### M2O 关联的独立查询
+
+M2O 字段通过单独的 SELECT 查询（不是 JOIN）：
 
 ```sql
--- 第二次查询：获取 author 关联
+-- 查询 author 关联
 SELECT
     `users`.`id`,
     CASE WHEN `users`.`role` != 'admin'
@@ -1647,11 +1783,15 @@ SELECT
     END AS `name`
 FROM `users`
 WHERE
-    `users`.`id` IN (?, ?, ?)  -- 从主查询结果提取的 author_id
-    AND `users`.`role` != 'admin'  -- 权限条件
+    `users`.`id` IN (101, 102, 103)  -- 从主查询结果提取的 author_id
+    AND `users`.`role` != 'admin'  -- 权限条件注入 WHERE
 ```
 
-**O2M 关联的独立查询：**
+**关键点：**
+- 权限条件同时出现在 `WHERE`（过滤不满足条件的行）和 `CASE WHEN`（字段置空）
+- 这是双重保护机制
+
+##### O2M 关联的独立查询
 
 ```typescript
 // runAst.ts:121-167
@@ -1667,16 +1807,16 @@ SELECT
     CASE WHEN `comments`.`is_approved` = 1
          THEN `comments`.`content`
     END AS `content`,
-    `comments`.`article_id`  -- 用于关联
+    `comments`.`article_id`  -- 用于关联回父表
 FROM `comments`
 WHERE
-    `comments`.`article_id` IN (?, ?, ?)  -- 父级主键
+    `comments`.`article_id` IN (1, 2, 3)  -- 父级主键
     AND `comments`.`is_approved` = 1  -- 权限条件
 ORDER BY `comments`.`id` DESC
 LIMIT 5
 ```
 
-### 13.5 阶段四：结果合并
+#### 阶段四：结果合并
 
 **假设数据库中的数据：**
 
@@ -1701,17 +1841,24 @@ comments:
 └────┴────────────┴─────────────┴─────────────┘
 ```
 
-#### 主查询结果（WHERE 过滤后）：
+##### 主查询结果（WHERE 过滤后）
 
-```
+```sql
 WHERE created_at >= '2024-01-01' AND status = 'published'
-
-结果只包含 id=1 和 id=3（id=2 的 status='draft' 被过滤）
 ```
 
-#### id=1 (published, author=101 role='editor'):
+结果只包含 `id=1` 和 `id=3`（`id=2` 的 `status='draft'` 被过滤）
 
-**主查询行：**
+**主查询返回行：**
+
+| id | title | comments (flag) | author_id |
+|----|-------|-----------------|-----------|
+| 1 | Article A | 1 | 101 |
+| 3 | Article C | 1 | 102 |
+
+##### id=1 (published, author=101 role='editor')
+
+**主查询行数据：**
 ```javascript
 {
     id: 1,
@@ -1722,21 +1869,32 @@ WHERE created_at >= '2024-01-01' AND status = 'published'
 ```
 
 **M2O 关联查询（users）：**
-```
+```sql
 WHERE id = 101 AND role != 'admin'
-→ 匹配，返回: { id: 101, name: 'User 101' }
+```
+
+查询返回：
+```javascript
+{ id: 101, name: 'User 101' }
 ```
 
 **O2M 关联查询（comments）：**
-```
+```sql
 WHERE article_id = 1 AND is_approved = true
-→ 只返回 id=1 的评论（id=2 is_approved=false 被过滤）
-→ { id: 1, content: 'Comment 1' }
+ORDER BY id DESC
+LIMIT 5
 ```
 
-#### id=3 (published, author=102 role='admin'):
+查询返回（只包含 is_approved=true 的评论）：
+```javascript
+[
+    { id: 1, content: 'Comment 1', article_id: 1 }
+]
+```
 
-**主查询行：**
+##### id=3 (published, author=102 role='admin')
+
+**主查询行数据：**
 ```javascript
 {
     id: 3,
@@ -1747,19 +1905,33 @@ WHERE article_id = 1 AND is_approved = true
 ```
 
 **M2O 关联查询（users）：**
-```
+```sql
 WHERE id = 102 AND role != 'admin'
-→ 不匹配（role='admin'），返回空
-→ author: null 或 { id: null, name: null }
+```
+
+**查询结果为空！** 因为 `role='admin'` 不满足权限条件
+
+```javascript
+[]  // 空结果
 ```
 
 **O2M 关联查询（comments）：**
-```
+```sql
 WHERE article_id = 3 AND is_approved = true
-→ 返回 { id: 4, content: 'Comment 4' }
+ORDER BY id DESC
+LIMIT 5
 ```
 
-### 13.6 最终返回结果
+查询返回：
+```javascript
+[
+    { id: 4, content: 'Comment 4', article_id: 3 }
+]
+```
+
+#### 阶段五：最终返回结果
+
+**合并处理后的结果：**
 
 ```json
 {
@@ -1781,7 +1953,7 @@ WHERE article_id = 3 AND is_approved = true
         {
             "id": 3,
             "title": "Article C",
-            "author": null,  // author.role='admin'，不满足权限
+            "author": null,  // author.role='admin'，WHERE 过滤掉了
             "comments": [
                 {
                     "id": 4,
@@ -1793,81 +1965,142 @@ WHERE article_id = 3 AND is_approved = true
 }
 ```
 
-### 13.7 权限传播路径总结
+**各字段的权限处理总结：**
+
+| 数据 | 权限处理方式 | 结果 |
+|-----|-------------|------|
+| Article 2 (draft) | WHERE 过滤 | 不返回 |
+| Article 1.title | CASE WHEN 满足 | 'Article A' |
+| Article 1.author (role='editor') | WHERE 满足 | 返回对象 |
+| Article 3.author (role='admin') | WHERE 不满足 | null |
+| Comment 2 (is_approved=false) | WHERE 过滤 | 不返回 |
+
+### 13.4 权限传播路径总结图
 
 ```
 用户请求
     │
     ▼
-┌─────────────────────────────────────────────────────┐
-│ 1. 初始 AST（无权限）                                │
-├─────────────────────────────────────────────────────┤
-│ articles                                            │
-│ ├── id                                              │
-│ ├── title                                           │
-│ ├── author (M2O → users)                            │
-│ │   ├── id                                          │
-│ │   └── name                                        │
-│ └── comments (O2M → comments)                       │
-│     ├── id                                          │
-│     └── content                                     │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ 1. 初始 AST（无权限）                                       │
+├────────────────────────────────────────────────────────────┤
+│ articles                                                   │
+│ ├── id                                                     │
+│ ├── title                                                  │
+│ ├── author (M2O → users)                                   │
+│ │   ├── id                                                 │
+│ │   └── name                                               │
+│ └── comments (O2M → comments)                              │
+│     ├── id                                                 │
+│     └── content                                            │
+└────────────────────────────────────────────────────────────┘
     │
     ▼
-┌─────────────────────────────────────────────────────┐
-│ 2. 注入权限后的 AST                                  │
-├─────────────────────────────────────────────────────┤
-│ articles                                            │
-│ ├── cases: [{ status: 'published' }]                │
-│ ├── id          (whenCase: [0])                     │
-│ ├── title       (whenCase: [0])                     │
-│ ├── author (M2O)                                    │
-│ │   ├── whenCase: [0]        ← 父级权限             │
-│ │   ├── cases: [{ role: '!= admin' }] ← 自身权限   │
-│ │   ├── id      (whenCase: [0])                     │
-│ │   └── name    (whenCase: [0])                     │
-│ └── comments (O2M)                                  │
-│     ├── whenCase: [0]        ← 父级权限             │
-│     ├── cases: [{ is_approved: true }] ← 自身权限   │
-│     ├── id      (whenCase: [0])                     │
-│     └── content (whenCase: [0])                     │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ 2. validatePathPermissions 验证                            │
+├────────────────────────────────────────────────────────────┤
+│ 路径 '' (articles):                                        │
+│   请求字段: {id, title, author, comments}                  │
+│   权限字段: {id, title, status, author, comments}          │
+│   ✓ 完全匹配（原示例缺少 comments，会 403）                  │
+│                                                            │
+│ 路径 'author' (users):                                     │
+│   请求字段: {id, name}                                     │
+│   权限字段: {id, name}                                     │
+│   ✓ 完全匹配                                                │
+│                                                            │
+│ 路径 'comments' (comments):                                │
+│   请求字段: {id, content}                                  │
+│   权限字段: {*}                                            │
+│   ✓ 完全权限                                                │
+└────────────────────────────────────────────────────────────┘
     │
     ▼
-┌─────────────────────────────────────────────────────┐
-│ 3. SQL 生成                                          │
-├─────────────────────────────────────────────────────┤
-│ 主查询 articles:                                     │
-│ ├── WHERE: created_at >= ? AND status = 'published' │
-│ ├── SELECT: id, CASE title, CASE comments_flag      │
-│ └── JOIN: 通过后续查询处理 M2O                       │
-│                                                     │
-│ 子查询 users (M2O):                                  │
-│ ├── WHERE: id IN (?) AND role != 'admin'            │
-│ └── SELECT: id, CASE name                           │
-│                                                     │
-│ 子查询 comments (O2M):                               │
-│ ├── WHERE: article_id IN (?) AND is_approved = true │
-│ ├── ORDER BY: id DESC                               │
-│ └── LIMIT: 5                                        │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ 3. 注入权限后的 AST                                         │
+├────────────────────────────────────────────────────────────┤
+│ articles                                                   │
+│ ├── cases: [{ status: 'published' }]                       │
+│ ├── id          (whenCase: [0])                            │
+│ ├── title       (whenCase: [0])                            │
+│ ├── author (M2O)                                           │
+│ │   ├── whenCase: [0]        ← 父级权限                    │
+│ │   ├── cases: [{ role: '!= admin' }] ← 自身权限          │
+│ │   ├── id      (whenCase: [0])                            │
+│ │   └── name    (whenCase: [0])                            │
+│ └── comments (O2M)                                         │
+│     ├── whenCase: [0]        ← 父级权限                    │
+│     ├── cases: [{ is_approved: true }] ← 自身权限          │
+│     ├── id      (whenCase: [0])                            │
+│     └── content (whenCase: [0])                            │
+└────────────────────────────────────────────────────────────┘
     │
     ▼
-┌─────────────────────────────────────────────────────┐
-│ 4. 结果过滤                                          │
-├─────────────────────────────────────────────────────┤
-│ id=1: ✓ (published)                                 │
-│ ├── title: 'Article A'     (条件满足)               │
-│ ├── author: {id:101, name:'...'} (role!='admin')    │
-│ └── comments: [Comment 1]   (is_approved=true)      │
-│                                                     │
-│ id=2: ✗ (draft → WHERE 过滤)                        │
-│                                                     │
-│ id=3: ✓ (published)                                 │
-│ ├── title: 'Article C'     (条件满足)               │
-│ ├── author: null            (role='admin' → 过滤)   │
-│ └── comments: [Comment 4]   (is_approved=true)      │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ 4. SQL 生成                                                 │
+├────────────────────────────────────────────────────────────┤
+│ 主查询 articles:                                            │
+│ ├── WHERE: created_at >= ? AND status = 'published'        │
+│ ├── SELECT: id, CASE title, CASE comments_flag             │
+│ └── 不使用 JOIN，M2O/O2M 均为独立查询                        │
+│                                                            │
+│ 子查询 users (M2O):                                         │
+│ ├── WHERE: id IN (?) AND role != 'admin'                   │
+│ └── SELECT: id, CASE name                                  │
+│                                                            │
+│ 子查询 comments (O2M):                                      │
+│ ├── WHERE: article_id IN (?) AND is_approved = true        │
+│ ├── ORDER BY: id DESC                                      │
+│ └── LIMIT: 5                                               │
+└────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌────────────────────────────────────────────────────────────┐
+│ 5. 结果过滤                                                 │
+├────────────────────────────────────────────────────────────┤
+│ id=1: ✓ (published)                                        │
+│ ├── title: 'Article A'     (CASE WHEN 满足)                │
+│ ├── author: {id:101, name:'...'} (role!='admin')           │
+│ └── comments: [Comment 1]   (is_approved=true)             │
+│                                                            │
+│ id=2: ✗ (draft → WHERE 过滤)                               │
+│                                                            │
+│ id=3: ✓ (published)                                        │
+│ ├── title: 'Article C'     (CASE WHEN 满足)                │
+│ ├── author: null            (role='admin' → WHERE 过滤)    │
+│ └── comments: [Comment 4]   (is_approved=true)             │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 13.5 关键教训
+
+**关联字段的权限检查是双重的：**
+
+1. **父集合层面**：访问 `articles.comments` 需要 `articles` 的 `fields` 包含 `comments`
+2. **子集合层面**：需要 `comments` 集合有读取权限
+
+**常见配置错误：**
+```javascript
+// ❌ 错误：父集合 fields 不包含关联字段
+{
+    "collection": "articles",
+    "fields": ["id", "title"],  // 缺少 comments
+    "permissions": { ... }
+}
+
+// ✅ 正确：父集合 fields 包含关联字段
+{
+    "collection": "articles",
+    "fields": ["id", "title", "comments"],  // 包含 comments
+    "permissions": { ... }
+}
+
+// ✅ 或者使用 *
+{
+    "collection": "articles",
+    "fields": ["*"],  // 所有字段
+    "permissions": { ... }
+}
 ```
 
 ## 14. 总结
