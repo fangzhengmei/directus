@@ -52,22 +52,36 @@ Directus 的环境配置加载由 `@directus/env` 包统一管理，采用懒加
 
 ### 3.2 配置加载优先级
 
-配置加载顺序（后面覆盖前面）：
+根据 `create-env.ts:18` 的对象展开逻辑 `{ ...baseConfiguration, ...fileConfiguration }`，
+**后面的属性会覆盖前面的同名属性**，因此实际优先级（从低到高，后者覆盖前者）：
 
-```
-1. 默认值 (DEFAULTS)
-   ↓
-2. 进程环境变量 (process.env)
-   ↓
-3. 配置文件 (.env, .config.js, .config.json, .config.yml 等)
-```
+| 优先级（从低到高） | 配置来源 | 说明 |
+|-------------------|----------|------|
+| 1（最低） | 默认值 (`DEFAULTS`) | 内置默认配置 |
+| 2 | 进程环境变量 (`process.env`) | 系统环境变量或运行时注入 |
+| 3（最高） | 配置文件 (`.env`, `.config.js`, `.json`, `.yml` 等) | 文件中的配置会覆盖前两者 |
+
+> **注意**：优先级顺序可能与直觉相反。例如，在 `.env` 文件中设置了 `DB_HOST=127.0.0.1`，同时通过 `export DB_HOST=192.168.1.100` 设置了进程环境变量，那么**最终生效的是 `.env` 中的 `127.0.0.1`**。
 
 关键代码：`packages/env/src/lib/create-env.ts:14-49`
 
 ```typescript
-const baseConfiguration = readConfigurationFromProcess();
+// 1. 先加载默认值到 output
+for (const [key, value] of Object.entries(DEFAULTS)) {
+    output[key] = ...;
+}
+
+// 2. 再用 rawConfiguration（process.env + 文件配置）覆盖
+for (let [key, value] of Object.entries(rawConfiguration)) {
+    output[key] = cast(value, key);  // 同名键会覆盖默认值
+}
+```
+
+其中 `rawConfiguration` 的构建：
+```typescript
+const baseConfiguration = readConfigurationFromProcess();   // process.env
 const fileConfiguration = readConfigurationFromFile(getConfigPath());
-const rawConfiguration = { ...baseConfiguration, ...fileConfiguration };
+const rawConfiguration = { ...baseConfiguration, ...fileConfiguration };  // 文件覆盖进程变量
 ```
 
 ### 3.3 配置文件支持格式
