@@ -186,15 +186,26 @@ const revision = await revisionsService.createOne({
 
 ### 3.2 Update（更新）场景
 
-**代码位置**：`api/src/services/items.ts:886-911`
+**代码位置**：`api/src/services/items.ts:814-911`
 
 ```typescript
-// 步骤 1：读取更新前的当前数据作为快照
+// 步骤 1：先执行数据库 UPDATE
+if (Object.keys(payloadWithTypeCasting).length > 0) {
+    try {
+        await trx(this.collection).update(payloadWithTypeCasting).whereIn(primaryKeyField, keys);
+    } catch (err: any) {
+        throw await translateDatabaseError(err, data);
+    }
+}
+
+// ... 处理 O2M 关系 ...
+
+// 步骤 2：在同一事务中读取更新后的数据作为快照
 const snapshots = await itemsService.readMany(keys, {
     fields: snapshotFields.length > 0 ? snapshotFields : ['*'],
 });
 
-// 步骤 2：构建 revision
+// 步骤 3：构建 revision
 const revisions = (
     await Promise.all(
         activity.map(async (activity, index) => ({
@@ -203,7 +214,7 @@ const revisions = (
             item: keys[index],
             data: Array.isArray(snapshots) && snapshots[index]
                 ? await payloadService.prepareDelta(snapshots[index])
-                : null,                    // 更新前的完整快照
+                : null,                    // 更新后的完整快照
             delta: await payloadService.prepareDelta(payloadWithTypeCasting),
                                         // 用户提交的更新内容
         })),
@@ -211,36 +222,75 @@ const revisions = (
 ).filter((revision) => revision.delta);
 ```
 
-**关键时间点**：
+**关键执行顺序**（同一事务内）：
 
 ```
 时间轴：─────────────────────────────────────────────────►
 
-T1: 数据库中的当前数据状态
+T1: 数据库中的当前数据状态（更新前）
      ↓
-T2: itemsService.readMany(keys)  ───► 保存为 revision.data
+T2: trx(this.collection).update(payloadWithTypeCasting)  ───► 执行 UPDATE SQL
      ↓
-T3: trx(this.collection).update(payloadWithTypeCasting)  ───► 实际执行更新
+T3: itemsService.readMany(keys)  ───► 读取到的是更新后的数据（同一事务可见）
      ↓
-T4: 构建 revision，delta = payloadWithTypeCasting
+T4: 构建 revision：
+     - revision.data = snapshots[index]（更新后的状态）
+     - revision.delta = payloadWithTypeCasting（用户提交的变更）
 ```
+
+**事务可见性说明**：
+
+数据库 UPDATE（T2）和 snapshots 读取（T3）使用**同一个事务对象 `trx`**。在数据库事务中，后续的 SELECT 可以看到同一事务内之前执行的 UPDATE 结果。因此 `snapshots` 读取到的是**更新后**的数据。
 
 **含义表**：
 
 | 字段 | 内容来源 | 含义 | 示例 |
 |------|---------|------|------|
-| `revision.data` | `snapshots[index]`（更新前从数据库读取） | **更新前**的完整数据快照 | `{ title: "旧标题", status: "draft" }` |
+| `revision.data` | `snapshots[index]`（更新后从数据库读取） | **更新后**的完整状态快照（该修订执行后的状态） | `{ title: "新标题", status: "draft" }` |
 | `revision.delta` | `payloadWithTypeCasting`（用户提交的更新） | **本次变更**的字段内容 | `{ title: "新标题" }` |
 
-**回滚效果**：恢复到更新前的状态（T1）
+**前端对比逻辑验证**：`app/src/views/private/components/comparison/use-comparison.ts:398-415`
+
+```typescript
+let incoming = revision.data || {};  // 当前修订的状态作为"新状态"
+if (compareToOption === 'Previous') {
+    previousRevision = findPreviousRevision(revision);
+    if (previousRevision && previousRevision.data) {
+        base = previousRevision.data;  // 前一个修订的状态作为"基准状态"
+    }
+}
+```
+
+前端用 **前一个 revision.data** 作为 base（旧状态），**当前 revision.data** 作为 incoming（新状态）进行对比。这验证了 `revision.data` 代表"该修订执行后的状态"。
+
+**回滚效果**：恢复到该修订执行后的状态
 
 **回滚验证代码**：`api/src/services/revisions.ts:10-24`
 
 ```typescript
 // revert 方法直接使用 revision.data 进行恢复
 await service.updateOne(revision['item'], revision['data']);
-// 即：将数据恢复到 revision.data 的状态（更新前）
+// 即：将数据恢复到 revision.data 的状态（该修订执行后的状态）
 ```
+
+**回滚场景示例**：
+
+假设修订历史：
+- R1 (create): data = `{ title: "A", status: "draft" }`
+- R2 (update: title="B"): data = `{ title: "B", status: "draft" }`
+- R3 (update: status="published"): data = `{ title: "B", status: "published" }`
+
+当前数据库状态 = R3.data
+
+执行 `revert(R2)`：
+- 使用 R2.data = `{ title: "B", status: "draft" }`
+- 更新后数据库 = `{ title: "B", status: "draft" }`
+- 即：**恢复到 R2 执行后的状态**
+
+执行 `revert(R1)`：
+- 使用 R1.data = `{ title: "A", status: "draft" }`
+- 更新后数据库 = `{ title: "A", status: "draft" }`
+- 即：**恢复到初始创建状态**
 
 ---
 
