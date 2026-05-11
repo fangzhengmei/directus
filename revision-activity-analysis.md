@@ -366,10 +366,10 @@ if (trackingAccountability === 'all') {
 
 | 操作类型 | revision.data | revision.delta | revision.version | 可回滚？ |
 |---------|--------------|---------------|-----------------|---------|
-| **create** | 创建时的 payload | 同 data | null | ✅ |
-| **update** | 更新**前**的数据库快照 | 本次提交的变更内容 | null | ✅ |
+| **create** | 创建时的完整状态 | 同 data | null | ✅ 恢复到创建状态 |
+| **update** | **更新后**的完整状态快照（该修订执行后的状态） | 本次提交的变更内容 | null | ✅ 恢复到该修订后的状态 |
 | **delete** | 无（不创建 revision） | 无 | 无 | ❌ |
-| **version-save** | 版本变更内容 | 同 data | 版本 ID | ⚠️ 有限制 |
+| **version-save** | 版本变更内容 | 同 data | 版本 ID | ⚠️ 有限制（只包含版本 delta） |
 
 ---
 
@@ -867,8 +867,10 @@ if (this.schema.collections[this.collection]!.accountability === 'all')
 
 | 问题 | 结论 | 代码依据 |
 |------|------|---------|
-| **update 场景下 revision.data** | 更新**前**的数据库快照 | `api/src/services/items.ts:889-907` |
+| **update 场景下 revision.data** | **更新后**的完整状态快照（该修订执行后的状态） | `api/src/services/items.ts:816`（UPDATE 在先）、`api/src/services/items.ts:889-891`（snapshots 读取在后，同一事务可见） |
 | **update 场景下 revision.delta** | 本次提交的变更内容 | `api/src/services/items.ts:908` |
+| **回滚语义** | 恢复到目标修订执行后的状态 | `api/src/services/revisions.ts:91`（`service.updateOne(revision['item'], revision['data'])`） |
+| **前端对比逻辑** | 用前一个 revision.data 作 base，当前 revision.data 作 incoming | `app/src/views/private/components/comparison/use-comparison.ts:398-415` |
 | **回滚 REST 入口** | `POST /utils/revert/{revision_id}` | `api/src/controllers/utils.ts:96-108` |
 | **回滚 GraphQL 入口** | `mutation { utils_revert(revision: ID!) }` | `api/src/services/graphql/resolvers/system-global.ts:406-420` |
 | **version-save revision 回滚** | 只更新主条目，不修改版本草稿 | `api/src/services/revisions.ts:10-24` |
