@@ -50,39 +50,40 @@ Directus 的环境配置加载由 `@directus/env` 包统一管理，采用懒加
 - 后续调用直接返回缓存的 `_cache.env`
 - 全局单例，整个应用共享同一配置实例
 
-### 3.2 配置加载优先级
+### 3.2 配置加载优先级（统一结论）
 
-根据 `create-env.ts:18` 的对象展开逻辑 `{ ...baseConfiguration, ...fileConfiguration }`，
-**后面的属性会覆盖前面的同名属性**，因此实际优先级（从低到高，后者覆盖前者）：
+根据 `packages/env/src/lib/create-env.ts:14-49` 的源码逻辑，环境配置加载优先级为：
 
-| 优先级（从低到高） | 配置来源 | 说明 |
-|-------------------|----------|------|
-| 1（最低） | 默认值 (`DEFAULTS`) | 内置默认配置 |
-| 2 | 进程环境变量 (`process.env`) | 系统环境变量或运行时注入 |
-| 3（最高） | 配置文件 (`.env`, `.config.js`, `.json`, `.yml` 等) | 文件中的配置会覆盖前两者 |
+**配置文件 > 进程环境变量 > 默认值**
 
-> **注意**：优先级顺序可能与直觉相反。例如，在 `.env` 文件中设置了 `DB_HOST=127.0.0.1`，同时通过 `export DB_HOST=192.168.1.100` 设置了进程环境变量，那么**最终生效的是 `.env` 中的 `127.0.0.1`**。
+即后者覆盖前者，配置文件中的值优先级最高。
 
-关键代码：`packages/env/src/lib/create-env.ts:14-49`
+| 优先级 | 配置来源 | 代码对应 |
+|--------|----------|----------|
+| 1（最低） | 默认值 (`DEFAULTS`) | `packages/env/src/constants/defaults.ts` |
+| 2 | 进程环境变量 (`process.env`) | `readConfigurationFromProcess()` |
+| 3（最高） | 配置文件 (`.env`, `.config.js` 等) | `readConfigurationFromFile(getConfigPath())` |
 
+**源码依据**：
 ```typescript
-// 1. 先加载默认值到 output
-for (const [key, value] of Object.entries(DEFAULTS)) {
-    output[key] = ...;
-}
-
-// 2. 再用 rawConfiguration（process.env + 文件配置）覆盖
-for (let [key, value] of Object.entries(rawConfiguration)) {
-    output[key] = cast(value, key);  // 同名键会覆盖默认值
-}
-```
-
-其中 `rawConfiguration` 的构建：
-```typescript
+// create-env.ts:15-18
 const baseConfiguration = readConfigurationFromProcess();   // process.env
 const fileConfiguration = readConfigurationFromFile(getConfigPath());
-const rawConfiguration = { ...baseConfiguration, ...fileConfiguration };  // 文件覆盖进程变量
+const rawConfiguration = { ...baseConfiguration, ...fileConfiguration };
+// 展开顺序：fileConfiguration 在后，覆盖 baseConfiguration
+
+// create-env.ts:22-24
+for (const [key, value] of Object.entries(DEFAULTS)) {
+    output[key] = ...;  // 先写入默认值
+}
+
+// create-env.ts:26-46
+for (let [key, value] of Object.entries(rawConfiguration)) {
+    output[key] = cast(value, key);  // 再用 rawConfiguration 覆盖默认值
+}
 ```
+
+**示例**：`.env` 中 `DB_HOST=127.0.0.1`，同时 `export DB_HOST=192.168.1.100`，最终生效的是 `.env` 中的 `127.0.0.1`。
 
 ### 3.3 配置文件支持格式
 
@@ -569,16 +570,26 @@ Kubernetes/Docker 启动
 
 1. **懒加载单例模式**：`useEnv()` 确保环境配置只加载一次，全局共享
 
-2. **配置优先级**：进程环境变量 > 配置文件 > 默认值，支持 `_FILE` 后缀从文件读取
+2. **配置优先级（可能反直觉）**：**配置文件 > 进程环境变量 > 默认值**
+   - 代码逻辑：`{ ...process.env, ...fileConfig }`，后者覆盖前者
+   - 支持 `_FILE` 后缀从文件读取敏感值
 
-3. **多格式配置支持**：`.env`, `.js`, `.json`, `.yml` 均可作为配置文件
+3. **多格式配置支持**：`.env`, `.js/.mjs/.cjs`, `.json`, `.yml/.yaml` 均可作为配置文件
 
-4. **分离的初始化路径**：
-   - `init`：交互式，面向开发者
-   - `bootstrap`：非交互式，面向自动化部署
+4. **两条独立的初始化路径**：
+   - `init`：**不依赖 .env**，交互式面向开发者，先生成数据库再写 `.env`
+   - `bootstrap`：**依赖 .env**，非交互式面向容器化部署，通过环境变量自动化
 
-5. **数据库状态机**：通过 `directus_collections` 表存在性判断安装状态，通过 `directus_migrations` 表追踪迁移进度
+5. **数据库状态机**：
+   - 通过 `directus_collections` 表存在性判断安装状态
+   - 通过 `directus_migrations` 表追踪迁移进度
+   - `bootstrap` 是幂等的，可重复执行
 
 6. **事件驱动架构**：`emitter.emitInit` 提供多个扩展点，允许插件介入初始化流程
 
 7. **优雅关闭**：Terminus 集成确保在 `SIGINT/SIGTERM` 时正确关闭数据库连接、WebSocket 和定时任务
+
+8. **命令衔接原则**：
+   - `init` 和 `bootstrap` 互斥，选择其一即可
+   - `start` 必须在 `init` 或 `bootstrap` 之后执行
+   - 容器场景：`bootstrap` + `start`；本地开发：`init` + `start`
