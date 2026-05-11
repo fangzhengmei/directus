@@ -36,7 +36,7 @@
 - `version-save` - 保存版本草稿
 
 **代码引用**：
-- 服务定义：`api/src/services/activity.ts:4-7`
+- 服务定义：`api/src/services/activity.ts:4-8`
 - 数据库结构：`packages/system-data/src/fields/activity.yaml:1-80`
 
 ---
@@ -898,3 +898,79 @@ if (this.schema.collections[this.collection]!.accountability === 'all')
 - 对于需要完整版本控制的集合，使用 `accountability: 'all'`
 - 对于临时或不重要的数据，使用 `accountability: null` 提升性能
 - 回滚 version-save 的 revision 时，注意它只包含版本变更的 delta，不是完整快照
+
+---
+
+## 十一、自检说明
+
+### 11.1 一致性核对方法
+
+为确保全文关于 update 场景下 `revision.data` 与 `revision.delta` 的结论口径一致，我采取了以下核对步骤：
+
+#### 步骤 1：交叉核对源码
+
+**核心依据**（`api/src/services/items.ts:788-911`）：
+
+1. **执行顺序确认**：`UPDATE`（行 816）→ `processO2M`（行 831-841）→ `create activity`（行 867-878）→ `readMany snapshots`（行 889-891）→ `build revision`（行 898-911）
+
+2. **事务可见性确认**：UPDATE 和 snapshots 读取使用**同一个事务对象 `trx`**。在标准数据库事务隔离级别下，同一事务内的后续 SELECT 可以看到该事务之前执行的 UPDATE 结果。
+
+3. **赋值关系确认**：
+   - `revision.data = snapshots[index]`（同一事务中读取到的更新后状态）
+   - `revision.delta = payloadWithTypeCasting`（用户提交的变更内容）
+
+#### 步骤 2：前端对比逻辑验证
+
+**代码位置**：`app/src/views/private/components/comparison/use-comparison.ts:398-415`
+
+```typescript
+let incoming = revision.data || {};  // 当前修订的状态作为"新状态"
+if (previousRevision && previousRevision.data) {
+    base = previousRevision.data;  // 前一个修订的状态作为"基准状态"
+}
+```
+
+前端用 **前一个 revision.data** 作 base（旧状态），**当前 revision.data** 作 incoming（新状态）进行对比。这验证了 `revision.data` 代表"该修订执行后的状态"。
+
+#### 步骤 3：全文关键词检索一致性
+
+对报告全文进行关键词检索，确保所有相关描述一致：
+
+| 检索关键词 | 命中位置 | 预期描述 | 实际检查 |
+|-----------|---------|---------|---------|
+| `更新后.*状态快照` | 3.2 含义表（行 249）、3.5 汇总表（行 370）、10.1 核心结论（行 870） | `revision.data` 是更新后的完整状态快照 | ✅ 一致 |
+| `本次提交的变更内容` | 3.2 含义表（行 250）、3.5 汇总表（行 370）、10.1 核心结论（行 871） | `revision.delta` 是本次提交的变更内容 | ✅ 一致 |
+| `该修订执行后的状态` | 3.2 回滚效果（行 266）、回滚示例（行 288）、10.1 核心结论（行 872） | 回滚恢复到该修订执行后的状态 | ✅ 一致 |
+
+#### 步骤 4：冲突检测
+
+之前存在的冲突：
+
+| 冲突位置 | 原描述 | 修正后描述 |
+|---------|-------|-----------|
+| 3.5 汇总表（原行 370） | `revision.data` 是更新**前**的数据库快照 | `revision.data` 是**更新后**的完整状态快照 |
+
+修正后：3.5 汇总表与 3.2 正文、10.1 核心结论完全一致。
+
+#### 步骤 5：代码位置验证
+
+确保所有结论都有对应的源码位置引用：
+
+| 结论 | 代码位置 | 检查 |
+|------|---------|------|
+| UPDATE 在先 | `api/src/services/items.ts:816` | ✅ |
+| snapshots 读取在后 | `api/src/services/items.ts:889-891` | ✅ |
+| revision.data 赋值 | `api/src/services/items.ts:904-907` | ✅ |
+| revision.delta 赋值 | `api/src/services/items.ts:908` | ✅ |
+| 前端对比逻辑 | `app/src/views/private/components/comparison/use-comparison.ts:398-415` | ✅ |
+| 回滚实现 | `api/src/services/revisions.ts:91` | ✅ |
+
+### 11.2 自检结论
+
+通过上述五步核对方法，确认：
+
+1. ✅ **update 场景下 `revision.data`**：更新后的完整状态快照（该修订执行后的状态）
+2. ✅ **update 场景下 `revision.delta`**：本次提交的变更内容
+3. ✅ **回滚语义**：恢复到目标修订执行后的状态
+4. ✅ **全文口径一致**：3.2 正文、3.5 汇总表、10.1 核心结论三处描述完全一致
+5. ✅ **所有结论均有源码佐证**：每个结论都有对应的代码位置引用
