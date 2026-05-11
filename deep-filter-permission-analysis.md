@@ -1641,18 +1641,18 @@ HTTP 403 Forbidden
 
 ### 13.2 修正后的权限配置
 
-**方法：在 articles 的权限中添加 `comments` 字段**
+**第一次修正：添加 `comments` 字段（仍不完整）**
 
 ```javascript
-// 权限 1: articles - 只能看已发布的文章
+// 权限 1: articles
 {
     "collection": "articles",
     "action": "read",
-    "fields": ["id", "title", "status", "author", "comments"],  // ✅ 添加了 comments
+    "fields": ["id", "title", "status", "author", "comments"],  // ⚠️ 缺少 created_at
     "permissions": { "status": { "_eq": "published" } }
 }
 
-// 权限 2: users - 只能看作者信息（不是管理员）
+// 权限 2: users
 {
     "collection": "users",
     "action": "read",
@@ -1660,7 +1660,7 @@ HTTP 403 Forbidden
     "permissions": { "role": { "_neq": "admin" } }
 }
 
-// 权限 3: comments - 只能看已批准的评论
+// 权限 3: comments
 {
     "collection": "comments",
     "action": "read",
@@ -1669,12 +1669,61 @@ HTTP 403 Forbidden
 }
 ```
 
+**问题：仍会报错！**
+
+根据13.1节的FieldMap分析：
+- `fieldMap.other.get('')` 请求了 `{id, title, author, comments}`
+- `fieldMap.read.get('')` 请求了 `{created_at}`（来自 filter 条件）
+
+第一次修正后的权限 `fields: ["id", "title", "status", "author", "comments"]` 包含了 `other` map 的字段，但**不包含** `read` map 的 `created_at`。
+
+校验流程：
+1. **第一步校验 `fieldMap.other`**：`{id, title, author, comments}` ⊆ 权限字段 ✓
+2. **第二步校验 `fieldMap.read`**：`{created_at}` ⊆ 权限字段 ✗（缺少 created_at）
+
+**第二次修正：添加 `created_at` 字段（完整版本）**
+
+```javascript
+// 权限 1: articles - 完整版本 ✅
+{
+    "collection": "articles",
+    "action": "read",
+    "fields": ["id", "title", "status", "author", "comments", "created_at"],  // ✅ 全部包含
+    "permissions": { "status": { "_eq": "published" } }
+}
+
+// 权限 2: users
+{
+    "collection": "users",
+    "action": "read",
+    "fields": ["id", "name"],
+    "permissions": { "role": { "_neq": "admin" } }
+}
+
+// 权限 3: comments
+{
+    "collection": "comments",
+    "action": "read",
+    "fields": ["*"],
+    "permissions": { "is_approved": { "_eq": true } }
+}
+```
+
+**校验流程（完整版本）：**
+1. **第一步校验 `fieldMap.other`**：
+   - `''`: `{id, title, author, comments}` ⊆ `{id, title, status, author, comments, created_at}` ✓
+   - `'author'`: `{id, name}` ⊆ `{id, name}` ✓
+   - `'comments'`: `{id, content}` ⊆ `{*}` ✓
+2. **第二步校验 `fieldMap.read`**：
+   - `''`: `{created_at}` ⊆ `{id, title, status, author, comments, created_at}` ✓
+   - `'comments'`: `{id}` ⊆ `{*}` ✓
+
 **或者更简单的方式：使用 `*`**
 ```javascript
 {
     "collection": "articles",
     "action": "read",
-    "fields": ["*"],  // 所有字段
+    "fields": ["*"],  // 所有字段，自动包含 comments、created_at 等
     "permissions": { "status": { "_eq": "published" } }
 }
 ```
@@ -2211,31 +2260,66 @@ LIMIT 5
 │ └── comments (O2M → comments)                              │
 │     ├── id                                                 │
 │     └── content                                            │
+│                                                            │
+│ query: { filter: { created_at: ... } }                     │
+│ comments.query: { limit: 5, sort: ['-id'] }                │
 └────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌────────────────────────────────────────────────────────────┐
-│ 2. validatePathPermissions 验证                            │
+│ 2. FieldMap 提取                                            │
 ├────────────────────────────────────────────────────────────┤
-│ 路径 '' (articles):                                        │
-│   请求字段: {id, title, author, comments}                  │
-│   权限字段: {id, title, status, author, comments}          │
-│   ✓ 完全匹配（原示例缺少 comments，会 403）                  │
 │                                                            │
-│ 路径 'author' (users):                                     │
-│   请求字段: {id, name}                                     │
-│   权限字段: {id, name}                                     │
-│   ✓ 完全匹配                                                │
+│ 第一步：extractFieldsFromChildren → other map               │
+│ ├── '': articles                                           │
+│ │   └── fields: {id, title, author, comments}              │
+│ ├── 'author': users                                        │
+│ │   └── fields: {id, name}                                 │
+│ └── 'comments': comments                                   │
+│     └── fields: {id, content}                              │
 │                                                            │
-│ 路径 'comments' (comments):                                │
-│   请求字段: {id, content}                                  │
-│   权限字段: {*}                                            │
-│   ✓ 完全权限                                                │
+│ 第二步：extractFieldsFromQuery → read/other map             │
+│ ├── filter.created_at → read map:                          │
+│ │   └── '': articles                                       │
+│ │       └── fields: {created_at}                           │
+│ └── sort.-id → read map:                                   │
+│     └── 'comments': comments                               │
+│         └── fields: {id}                                   │
 └────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌────────────────────────────────────────────────────────────┐
-│ 3. 注入权限后的 AST                                         │
+│ 3. validatePathPermissions 验证（两步）                     │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│ 第一步：校验 fieldMap.other（使用 permissions）             │
+│ ├── '': articles                                           │
+│ │   请求: {id, title, author, comments}                    │
+│ │   权限: {id, title, status, author, comments, created_at}│
+│ │   ✓ 完全匹配                                              │
+│ ├── 'author': users                                        │
+│ │   请求: {id, name}                                       │
+│ │   权限: {id, name}                                       │
+│ │   ✓ 完全匹配                                              │
+│ └── 'comments': comments                                   │
+│     请求: {id, content}                                    │
+│     权限: {*}                                              │
+│     ✓ 完全权限                                              │
+│                                                            │
+│ 第二步：校验 fieldMap.read（使用 readPermissions）          │
+│ ├── '': articles                                           │
+│ │   请求: {created_at}                                     │
+│ │   权限: {id, title, status, author, comments, created_at}│
+│ │   ✓ 完全匹配                                              │
+│ └── 'comments': comments                                   │
+│     请求: {id}                                             │
+│     权限: {*}                                              │
+│     ✓ 完全权限                                              │
+└────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌────────────────────────────────────────────────────────────┐
+│ 4. 注入权限后的 AST                                         │
 ├────────────────────────────────────────────────────────────┤
 │ articles                                                   │
 │ ├── cases: [{ status: 'published' }]                       │
@@ -2255,7 +2339,7 @@ LIMIT 5
     │
     ▼
 ┌────────────────────────────────────────────────────────────┐
-│ 4. SQL 生成                                                 │
+│ 5. SQL 生成                                                 │
 ├────────────────────────────────────────────────────────────┤
 │ 主查询 articles:                                            │
 │ ├── WHERE: created_at >= ? AND status = 'published'        │
@@ -2274,7 +2358,7 @@ LIMIT 5
     │
     ▼
 ┌────────────────────────────────────────────────────────────┐
-│ 5. 结果过滤                                                 │
+│ 6. 结果过滤                                                 │
 ├────────────────────────────────────────────────────────────┤
 │ id=1: ✓ (published)                                        │
 │ ├── title: 'Article A'     (CASE WHEN 满足)                │
@@ -2292,6 +2376,25 @@ LIMIT 5
 
 ### 13.5 关键教训
 
+**FieldMap 分区规则：**
+
+| 来源函数 | 写入的 map | 内容 |
+|---------|-----------|------|
+| `extractFieldsFromChildren` | `other` | AST children 中的字段（id, title, author, comments 等） |
+| `extractFieldsFromQuery` - filter/sort | `read` | 过滤、排序条件中的字段 |
+| `extractFieldsFromQuery` - aggregate/group | `other` | 聚合、分组条件中的字段 |
+
+**校验顺序和权限集合：**
+
+| 校验步骤 | 使用的权限集合 | 目的 |
+|---------|---------------|------|
+| 校验 `fieldMap.other` | `permissions`（当前 action） | 检查读取/修改的字段权限 |
+| 校验 `fieldMap.read` | `readPermissions`（始终是 read action） | 检查过滤/排序使用的字段权限 |
+
+**对于 `action === 'read'`：**
+- `readPermissions === permissions`（同一个集合）
+- 两个校验步骤使用相同的权限规则
+
 **关联字段的权限检查是双重的：**
 
 1. **父集合层面**：访问 `articles.comments` 需要 `articles` 的 `fields` 包含 `comments`
@@ -2299,24 +2402,33 @@ LIMIT 5
 
 **常见配置错误：**
 ```javascript
-// ❌ 错误：父集合 fields 不包含关联字段
+// ❌ 错误 1：父集合 fields 不包含关联字段
 {
     "collection": "articles",
-    "fields": ["id", "title"],  // 缺少 comments
+    "fields": ["id", "title", "author"],  // 缺少 comments
+    "permissions": { ... }
+}
+// 报错：在 fieldMap.other 校验时失败
+
+// ❌ 错误 2：父集合 fields 不包含 filter/sort 字段
+{
+    "collection": "articles",
+    "fields": ["id", "title", "author", "comments"],  // 缺少 created_at
+    "permissions": { ... }
+}
+// 报错：在 fieldMap.read 校验时失败
+
+// ✅ 正确：完整的字段配置
+{
+    "collection": "articles",
+    "fields": ["id", "title", "status", "author", "comments", "created_at"],
     "permissions": { ... }
 }
 
-// ✅ 正确：父集合 fields 包含关联字段
+// ✅ 或者使用 *（最简单）
 {
     "collection": "articles",
-    "fields": ["id", "title", "comments"],  // 包含 comments
-    "permissions": { ... }
-}
-
-// ✅ 或者使用 *
-{
-    "collection": "articles",
-    "fields": ["*"],  // 所有字段
+    "fields": ["*"],
     "permissions": { ... }
 }
 ```
